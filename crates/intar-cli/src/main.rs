@@ -24,8 +24,6 @@ enum Commands {
         scenario: PathBuf,
     },
     /// Show status of running scenario
-    Status,
-    /// SSH into a VM
     Ssh {
         /// Name of the VM
         vm_name: String,
@@ -33,10 +31,6 @@ enum Commands {
         #[arg(short, long)]
         run: Option<String>,
     },
-    /// Reset scenario to initial state
-    Reset,
-    /// Stop the running scenario
-    Stop,
     /// List available scenarios
     List {
         /// Directory to search for scenarios
@@ -83,17 +77,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start { scenario } => {
             commands::start(scenario).await?;
         }
-        Commands::Status => {
-            commands::status()?;
-        }
         Commands::Ssh { vm_name, run } => {
             commands::ssh(&vm_name, run.as_deref())?;
-        }
-        Commands::Reset => {
-            commands::reset();
-        }
-        Commands::Stop => {
-            commands::stop()?;
         }
         Commands::List { dir } => {
             commands::list(&dir)?;
