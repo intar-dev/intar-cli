@@ -1,0 +1,21 @@
+[package]
+name = "intar-probes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Probe definitions and evaluation for intar"
+
+[features]
+default = []
+kubernetes = ["dep:kube", "dep:k8s-openapi"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }

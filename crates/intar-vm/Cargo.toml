@@ -1,0 +1,27 @@
+[package]
+name = "intar-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "QEMU VM management for intar"
+
+[dependencies]
+intar-core.workspace = true
+intar-probes.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tempfile = "=3.23.0"
+dirs.workspace = true
+petname.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+hex.workspace = true
+indicatif.workspace = true
+futures-util.workspace = true
+socket2.workspace = true

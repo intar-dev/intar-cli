@@ -1,0 +1,20 @@
+[package]
+name = "intar-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "In-VM agent for intar probe checking"
+
+[[bin]]
+name = "intar-agent"
+path = "src/main.rs"
+
+[dependencies]
+intar-probes = { workspace = true, features = ["kubernetes"] }
+k8s-openapi = { workspace = true, features = ["v1_30"] }
+base64.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

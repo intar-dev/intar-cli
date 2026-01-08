@@ -1,0 +1,418 @@
+use crate::agent::{AGENT_AARCH64, AGENT_X86_64, is_placeholder};
+use anyhow::{Context, Result, bail};
+use intar_core::Scenario;
+use intar_ui::App;
+use intar_vm::{IntarDirs, RunState};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+pub async fn start(scenario_path: PathBuf) -> Result<()> {
+    if is_placeholder(AGENT_X86_64) || is_placeholder(AGENT_AARCH64) {
+        bail!(
+            "Agent binaries not built. Please install cargo-zigbuild and zig:\n\
+            \n\
+            cargo install cargo-zigbuild\n\
+            brew install zig  # or appropriate package manager\n\
+            \n\
+            Then rebuild (debug is fine) with: cargo build -p intar-cli\n\
+            or simply re-run: cargo run --bin intar -- start <scenario.hcl>"
+        );
+    }
+
+    let scenario = Scenario::from_file(&scenario_path).context("Failed to parse scenario")?;
+
+    scenario.validate().context("Scenario validation failed")?;
+
+    let mut app = App::new(scenario, AGENT_X86_64.to_vec(), AGENT_AARCH64.to_vec());
+    app.run().await?;
+
+    Ok(())
+}
+
+pub fn status() -> Result<()> {
+    let dirs = IntarDirs::new().context("Failed to initialize directories")?;
+    let runs_dir = dirs.runs_dir();
+
+    if !runs_dir.exists() {
+        println!("No scenario runs found.");
+        return Ok(());
+    }
+
+    println!("Scenario runs in {}:", runs_dir.display());
+    for entry in std::fs::read_dir(&runs_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name();
+            let has_qmp_sock = std::fs::read_dir(entry.path())?
+                .filter_map(Result::ok)
+                .any(|e| e.path().extension().is_some_and(|ext| ext == "sock"));
+            let status = if has_qmp_sock { "running" } else { "stopped" };
+            println!("  {} ({})", name.to_string_lossy(), status);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn ssh(vm_name: &str, run_name: Option<&str>) -> Result<()> {
+    let dirs = IntarDirs::new().context("Failed to initialize directories")?;
+    let runs_root = dirs.runs_dir();
+
+    let run_dir = if let Some(name) = run_name {
+        let dir = runs_root.join(name);
+        if !dir.exists() {
+            bail!("Run '{}' not found in {}", name, runs_root.display());
+        }
+        if !dir.join("state.json").exists() {
+            bail!("Run '{name}' has no state file");
+        }
+        dir
+    } else {
+        let mut entries: Vec<_> = std::fs::read_dir(&runs_root)?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|e| e.path().join("state.json").exists())
+            .collect();
+
+        if entries.is_empty() {
+            bail!("No running scenario found. Start one with: intar start <scenario.hcl>");
+        }
+
+        entries.sort_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+
+        entries.pop().unwrap().path()
+    };
+    let state = intar_vm::RunState::load(&run_dir).context("Failed to load run state")?;
+
+    let vm_info = state
+        .vms
+        .iter()
+        .find(|vm| vm.name == vm_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "VM '{}' not found. Available VMs: {}",
+                vm_name,
+                state
+                    .vms
+                    .iter()
+                    .map(|v| v.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+
+    let ssh_key = run_dir.join("id_ed25519");
+    if !ssh_key.exists() {
+        bail!("SSH key not found at {}", ssh_key.display());
+    }
+
+    let status = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            &ssh_key.to_string_lossy(),
+            "-p",
+            &vm_info.ssh_port.to_string(),
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "user@localhost",
+        ])
+        .status()
+        .context("Failed to execute ssh")?;
+
+    if !status.success() {
+        bail!("SSH exited with status: {status}");
+    }
+
+    Ok(())
+}
+
+pub fn reset() {
+    println!("Reset must be done from within the running UI (press 'r')");
+}
+
+pub fn stop() -> Result<()> {
+    let dirs = IntarDirs::new().context("Failed to initialize directories")?;
+    let runs_root = dirs.runs_dir();
+
+    if !runs_root.exists() {
+        println!("No scenario runs found.");
+        return Ok(());
+    }
+
+    let run_dirs: Vec<PathBuf> = std::fs::read_dir(&runs_root)?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+
+    if run_dirs.is_empty() {
+        println!("No scenario runs found.");
+        return Ok(());
+    }
+
+    for run_dir in run_dirs {
+        stop_run_dir(&run_dir)?;
+        println!("Stopped and cleaned run at {}", run_dir.display());
+    }
+
+    Ok(())
+}
+
+pub fn list(dir: &Path) -> Result<()> {
+    println!("Searching for scenarios in: {}", dir.display());
+
+    let entries: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "hcl"))
+        .map(walkdir::DirEntry::into_path)
+        .collect();
+
+    if entries.is_empty() {
+        println!("No .hcl scenario files found.");
+        return Ok(());
+    }
+
+    for path in entries {
+        if let Ok(scenario) = Scenario::from_file(&path) {
+            println!("  {} - {}", scenario.name, scenario.description);
+            println!("    File: {}", path.display());
+            println!("    VMs: {}", scenario.vms.len());
+            println!("    Probes: {}", scenario.total_probe_count());
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+fn stop_run_dir(run_dir: &Path) -> Result<()> {
+    let state = RunState::load(run_dir);
+    let mut vms_failed_to_stop = Vec::new();
+
+    if let Ok(state) = state {
+        for vm in state.vms {
+            let qmp_socket = run_dir.join(format!("{}-qmp.sock", vm.name));
+            let pid_file = run_dir.join(format!("{}-qemu.pid", vm.name));
+
+            if qmp_socket.exists()
+                && let Err(e) = send_qmp_quit(&qmp_socket)
+            {
+                eprintln!(
+                    "Warning: failed to stop VM '{}' via {}: {}",
+                    vm.name,
+                    qmp_socket.display(),
+                    e
+                );
+            }
+
+            if let Some(pid) = read_pid_file(&pid_file) {
+                if let Err(e) = wait_for_pid_exit(pid, Duration::from_secs(3)) {
+                    eprintln!(
+                        "Warning: failed waiting for VM '{}' (pid {pid}) to exit: {e}",
+                        vm.name
+                    );
+                }
+
+                if pid_is_running(pid) {
+                    if let Err(e) = send_kill_signal(pid, "-TERM") {
+                        eprintln!("Warning: failed to send SIGTERM to pid {pid}: {e}");
+                    }
+                    let _ = wait_for_pid_exit(pid, Duration::from_secs(2));
+                }
+
+                if pid_is_running(pid) {
+                    if let Err(e) = send_kill_signal(pid, "-KILL") {
+                        eprintln!("Warning: failed to send SIGKILL to pid {pid}: {e}");
+                    }
+                    let _ = wait_for_pid_exit(pid, Duration::from_secs(2));
+                }
+
+                if pid_is_running(pid) {
+                    vms_failed_to_stop.push(vm.name);
+                }
+            }
+        }
+    } else if let Err(e) = state {
+        eprintln!(
+            "Warning: failed to load state for {}: {}",
+            run_dir.display(),
+            e
+        );
+    }
+
+    if !vms_failed_to_stop.is_empty() {
+        bail!(
+            "Failed to stop VMs in {}: {}",
+            run_dir.display(),
+            vms_failed_to_stop.join(", ")
+        );
+    }
+
+    remove_dir_all_with_retries(run_dir, 5, Duration::from_millis(200))
+        .with_context(|| format!("Failed to delete {}", run_dir.display()))?;
+
+    Ok(())
+}
+
+fn send_qmp_quit(socket: &Path) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+
+    // QMP greeting
+    let _ = reader.read_line(&mut line);
+
+    stream.write_all(br#"{"execute": "qmp_capabilities"}\n"#)?;
+    line.clear();
+    let _ = reader.read_line(&mut line);
+
+    stream.write_all(br#"{"execute": "quit"}\n"#)?;
+
+    Ok(())
+}
+
+fn read_pid_file(path: &Path) -> Option<u32> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u32>().ok()
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn send_kill_signal(pid: u32, signal: &str) -> std::io::Result<()> {
+    let status = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "kill {signal} {pid} failed with status {status}"
+    )))
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> std::io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_is_running(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(std::io::Error::other(
+        "timed out waiting for process to exit",
+    ))
+}
+
+fn remove_dir_all_with_retries(
+    path: &Path,
+    attempts: usize,
+    delay: Duration,
+) -> std::io::Result<()> {
+    for i in 0..attempts {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if i + 1 == attempts {
+                    return Err(e);
+                }
+                std::thread::sleep(delay);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn logs(run_name: Option<&str>, vm_name: Option<&str>, log_type: &str) -> Result<()> {
+    let dirs = IntarDirs::new().context("Failed to initialize directories")?;
+    let runs_root = dirs.runs_dir();
+
+    let run_dir = if let Some(name) = run_name {
+        let dir = runs_root.join(name);
+        if !dir.exists() {
+            bail!("Run '{}' not found in {}", name, runs_root.display());
+        }
+        dir
+    } else {
+        let mut entries: Vec<_> = std::fs::read_dir(&runs_root)?
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .collect();
+
+        if entries.is_empty() {
+            bail!("No scenario runs found in {}", runs_root.display());
+        }
+
+        entries.sort_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+
+        entries.pop().unwrap().path()
+    };
+
+    let logs_dir = run_dir.join("logs");
+    if !logs_dir.exists() {
+        bail!("No logs directory found in {}", run_dir.display());
+    }
+
+    let vm_dir = if let Some(name) = vm_name {
+        let dir = logs_dir.join(name);
+        if !dir.exists() {
+            bail!("VM '{}' not found in {}", name, logs_dir.display());
+        }
+        dir
+    } else {
+        let first_vm = std::fs::read_dir(&logs_dir)?
+            .filter_map(Result::ok)
+            .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false));
+
+        match first_vm {
+            Some(entry) => entry.path(),
+            None => bail!("No VM logs found in {}", logs_dir.display()),
+        }
+    };
+
+    let log_file = match log_type {
+        "qemu" => vm_dir.join("qemu.log"),
+        "console" => vm_dir.join("console.log"),
+        "user-data" => vm_dir.join("user-data.yaml"),
+        "meta-data" => vm_dir.join("meta-data.yaml"),
+        other => bail!("Unknown log type '{other}'. Use: qemu, console, user-data, meta-data",),
+    };
+
+    if !log_file.exists() {
+        bail!("Log file not found: {}", log_file.display());
+    }
+
+    println!("=== {} ===\n", log_file.display());
+    let content = std::fs::read_to_string(&log_file)?;
+    print!("{content}");
+
+    Ok(())
+}

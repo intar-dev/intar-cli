@@ -1,0 +1,29 @@
+[package]
+name = "intar-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI for intar DevOps lab environment"
+
+[[bin]]
+name = "intar"
+path = "src/main.rs"
+
+[dependencies]
+intar-core.workspace = true
+intar-probes.workspace = true
+intar-vm.workspace = true
+intar-ui.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[build-dependencies]
+anyhow = "=1.0.100"
+
+[dependencies.walkdir]
+version = "=2.5.0"
