@@ -169,11 +169,7 @@ enum AltScreenMode {
 
 impl AltScreenMode {
     fn from_env() -> Self {
-        if use_alt_screen_from_env() {
-            Self::Enabled
-        } else {
-            Self::Disabled
-        }
+        Self::Enabled
     }
 
     fn enabled(self) -> bool {
@@ -234,7 +230,7 @@ impl App {
         agent_binary_aarch64: Vec<u8>,
     ) -> Self {
         let now = Instant::now();
-        let theme_settings = ThemeSettings::from_env();
+        let theme_settings = ThemeSettings::resolve();
         Self {
             scenario,
             runner: None,
@@ -1056,22 +1052,6 @@ fn restore_terminal(
     execute!(terminal.backend_mut(), DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
-}
-
-fn use_alt_screen_from_env() -> bool {
-    if env_flag("INTAR_NO_ALT_SCREEN") == Some(true) {
-        return false;
-    }
-    env_flag("INTAR_ALT_SCREEN").unwrap_or(true)
-}
-
-fn env_flag(key: &str) -> Option<bool> {
-    let value = std::env::var(key).ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
 }
 
 fn detect_arch() -> String {

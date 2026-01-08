@@ -61,13 +61,6 @@ impl Default for Theme {
 
 impl ThemeSettings {
     #[must_use]
-    pub fn from_env() -> Self {
-        let color_level = ColorLevel::detect();
-        let mode = ThemeMode::from_env_override().unwrap_or(ThemeMode::Dark);
-        Self { mode, color_level }
-    }
-
-    #[must_use]
     pub fn resolve() -> Self {
         let color_level = ColorLevel::detect();
         let mode = ThemeMode::resolve(color_level);
@@ -77,16 +70,7 @@ impl ThemeSettings {
 
 impl ThemeMode {
     #[must_use]
-    fn from_env_override() -> Option<Self> {
-        env_theme_override("INTAR_THEME").or_else(|| env_theme_override("CLITHEME"))
-    }
-
-    #[must_use]
     fn resolve(color_level: ColorLevel) -> Self {
-        if let Some(mode) = Self::from_env_override() {
-            return mode;
-        }
-
         if color_level == ColorLevel::None {
             return ThemeMode::Dark;
         }
@@ -321,15 +305,6 @@ fn palette_light_ansi16() -> ThemePalette {
         border: Color::Gray,
         highlight: Color::Gray,
         surface: Color::White,
-    }
-}
-
-fn env_theme_override(var: &str) -> Option<ThemeMode> {
-    let value = env::var(var).ok()?;
-    match value.trim().to_ascii_lowercase().as_str() {
-        "dark" => Some(ThemeMode::Dark),
-        "light" => Some(ThemeMode::Light),
-        _ => None,
     }
 }
 
