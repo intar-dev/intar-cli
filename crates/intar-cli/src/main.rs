@@ -1,11 +1,21 @@
 mod agent;
-mod commands;
+#[cfg(unix)]
+mod commands_unix;
+#[cfg(not(any(unix, windows)))]
+mod commands_unix;
+#[cfg(windows)]
+mod commands_windows;
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
-use intar_vm::IntarDirs;
 use std::path::PathBuf;
-use tracing_appender::rolling;
+use tracing_appender::{non_blocking::WorkerGuard, rolling};
+
+#[cfg(unix)]
+use commands_unix as commands;
+#[cfg(not(any(unix, windows)))]
+use commands_unix as commands;
+#[cfg(windows)]
+use commands_windows as commands;
 
 #[derive(Parser)]
 #[command(name = "intar")]
@@ -23,13 +33,16 @@ enum Commands {
         /// Path to the scenario HCL file
         scenario: PathBuf,
     },
-    /// Show status of running scenario
+    /// Open an SSH session to a VM
     Ssh {
         /// Name of the VM
         vm_name: String,
         /// Name of the run (defaults to most recent)
         #[arg(short, long)]
         run: Option<String>,
+        /// Run a command on the VM and exit
+        #[arg(short, long)]
+        command: Option<String>,
     },
     /// List available scenarios
     List {
@@ -53,23 +66,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let dirs = IntarDirs::new().context("Failed to initialize directories")?;
-    dirs.ensure_dirs()
-        .context("Failed to create intar directories")?;
-
-    let log_dir = dirs.state.join("logs");
-    std::fs::create_dir_all(&log_dir)?;
-    let file_appender = rolling::never(&log_dir, "intar.log");
-    let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .with_ansi(false)
-        .with_writer(non_blocking)
-        .init();
+    let _log_guard = init_logging();
 
     let cli = Cli::parse();
 
@@ -77,8 +74,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start { scenario } => {
             commands::start(scenario).await?;
         }
-        Commands::Ssh { vm_name, run } => {
-            commands::ssh(&vm_name, run.as_deref())?;
+        Commands::Ssh {
+            vm_name,
+            run,
+            command,
+        } => {
+            commands::ssh(&vm_name, run.as_deref(), command.as_deref())?;
         }
         Commands::List { dir } => {
             commands::list(&dir)?;
@@ -89,4 +90,44 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn intar_log_dir() -> anyhow::Result<std::path::PathBuf> {
+    let state_dir = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .ok_or_else(|| anyhow::anyhow!("state directory not found"))?;
+    Ok(state_dir.join("intar").join("logs"))
+}
+
+fn init_logging() -> Option<WorkerGuard> {
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+
+    if let Ok(log_dir) = intar_log_dir()
+        && std::fs::create_dir_all(&log_dir).is_ok()
+    {
+        let log_path = log_dir.join("intar.log");
+        if std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .is_ok()
+        {
+            let file_appender = rolling::never(&log_dir, "intar.log");
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_ansi(false)
+                .with_writer(non_blocking)
+                .init();
+            return Some(guard);
+        }
+    }
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .init();
+    None
 }

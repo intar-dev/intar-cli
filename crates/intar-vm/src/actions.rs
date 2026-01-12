@@ -1,9 +1,9 @@
+use crate::{HostSocket, connect_host_socket};
 use intar_probes::ActionEvent;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -30,13 +30,13 @@ struct ActionLogRecord<'a> {
 #[must_use]
 pub fn start_vm_actions_task(
     vm_name: String,
-    actions_socket: PathBuf,
+    actions_socket: HostSocket,
     log_path: PathBuf,
     tx_lines: mpsc::Sender<ActionLineEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let Ok(stream) = UnixStream::connect(&actions_socket).await else {
+            let Ok(stream) = connect_host_socket(&actions_socket).await else {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 continue;
             };

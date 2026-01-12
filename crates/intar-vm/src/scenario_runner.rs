@@ -1,9 +1,9 @@
 use crate::{
-    ActionLineEvent, CloudInitGenerator, ImageCache, IntarDirs, LanSwitch, QemuInstance,
-    ScenarioState, SharedNetworkEndpoint, VmError, VmState, find_free_ports, find_free_udp_port,
-    path_to_str, start_vm_actions_task, try_connect,
+    ActionLineEvent, CloudInitGenerator, HostSocket, ImageCache, IntarDirs, LanSwitch,
+    QemuInstance, QemuInstanceConfig, QemuSockets, ScenarioState, SharedNetworkEndpoint, VmError,
+    VmState, find_free_ports, find_free_udp_port, path_to_str, start_vm_actions_task, try_connect,
 };
-use intar_core::{ProbePhase, Scenario, VmDefinition, WriteFile};
+use intar_core::{CloudInitConfig, ProbePhase, Scenario, VmDefinition, WriteFile};
 use intar_probes::{ProbeResult, ProbeSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -154,7 +154,12 @@ impl ScenarioRunner {
 
         let (private_key, public_key) = generate_ssh_keypair(&work_dir)?;
 
-        let ports = find_free_ports(scenario.vms.len())?;
+        let port_count = if cfg!(target_os = "windows") {
+            scenario.vms.len() * 4
+        } else {
+            scenario.vms.len()
+        };
+        let ports = find_free_ports(port_count)?;
         let shared_lan_hub_port = if scenario.vms.len() > 1 {
             Some(find_free_udp_port()?)
         } else {
@@ -249,20 +254,67 @@ impl ScenarioRunner {
         let primary_mac_for_cfg = primary_mac.clone();
         let lan_mac_for_cfg = lan_mac.clone();
         let mgmt_ip = Self::mgmt_ip(vm_index)?;
+        #[cfg(unix)]
+        let qmp_socket = self.host_socket_for_vm(&vm_def.name, "qmp");
+        #[cfg(windows)]
+        let qmp_socket = self.host_socket_for_vm(&vm_def.name, "qmp")?;
+
+        #[cfg(unix)]
+        let serial_socket = self.host_socket_for_vm(&vm_def.name, "serial");
+        #[cfg(windows)]
+        let serial_socket = self.host_socket_for_vm(&vm_def.name, "serial")?;
+
+        #[cfg(unix)]
+        let actions_socket = self.host_socket_for_vm(&vm_def.name, "actions");
+        #[cfg(windows)]
+        let actions_socket = self.host_socket_for_vm(&vm_def.name, "actions")?;
+
         let mut vm = QemuInstance::new(
-            vm_def.clone(),
+            QemuInstanceConfig {
+                definition: vm_def.clone(),
+                ssh_port,
+                mgmt_ip: mgmt_ip.clone(),
+                shared_lan: shared_ep,
+                primary_mac: Some(primary_mac),
+                lan_mac,
+                sockets: QemuSockets {
+                    qmp: qmp_socket,
+                    serial: serial_socket,
+                    actions: actions_socket,
+                },
+            },
             &self.work_dir,
-            ssh_port,
-            mgmt_ip.clone(),
-            shared_ep,
-            Some(primary_mac),
-            lan_mac,
         );
         let base_image = self.base_image_for_vm(vm_def, image_cache, arch)?;
         vm.create_overlay_disk(&base_image)?;
         let agent_binary = self.agent_binary_for_arch(arch)?;
         let cloud_init_gen =
             CloudInitGenerator::new(self.ssh_public_key.clone(), agent_binary.clone());
+        let cloud_init_config = self.build_cloud_init_config(
+            vm_def,
+            &primary_mac_for_cfg,
+            &mgmt_ip,
+            lan_mac_for_cfg.as_deref(),
+            has_shared_lan,
+        )?;
+        cloud_init_gen.save_to_logs(&cloud_init_config, &vm_def.name, &vm.logs_dir)?;
+        cloud_init_gen.create_iso(&cloud_init_config, &vm_def.name, &vm.cloud_init_iso)?;
+
+        self.vms.insert(vm_def.name.clone(), vm);
+        self.probe_results
+            .insert(vm_def.name.clone(), HashMap::new());
+        self.vm_order.push(vm_def.name.clone());
+        Ok(())
+    }
+
+    fn build_cloud_init_config(
+        &self,
+        vm_def: &VmDefinition,
+        primary_mac: &str,
+        mgmt_ip: &str,
+        lan_mac: Option<&str>,
+        has_shared_lan: bool,
+    ) -> Result<CloudInitConfig, VmError> {
         let mut cloud_init_config = vm_def.cloud_init.clone().unwrap_or_default();
         apply_vm_steps_to_cloud_init(&vm_def.name, &vm_def.steps, &mut cloud_init_config)?;
 
@@ -285,26 +337,24 @@ impl ScenarioRunner {
         };
 
         cloud_init_config.network_config = Some(Self::netplan_config(
-            &primary_mac_for_cfg,
-            &mgmt_ip,
-            cluster_ip.as_deref().zip(lan_mac_for_cfg.as_deref()),
+            primary_mac,
+            mgmt_ip,
+            cluster_ip.as_deref().zip(lan_mac),
         )?);
 
         // Disable IPv6 system-wide.
         cloud_init_config.write_files.push(WriteFile {
             path: "/etc/sysctl.d/99-intar-no-ipv6.conf".into(),
-            content: "net.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\nnet.ipv6.conf.lo.disable_ipv6 = 1\n".into(),
+            content:
+                "net.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\nnet.ipv6.conf.lo.disable_ipv6 = 1\n".into(),
             permissions: Some("0644".into()),
         });
 
         let mut runcmd = String::new();
         // Interface naming is handled by netplan `match` + `set-name` above.
         // This script just applies addresses immediately for the first boot.
-        let net_setup = Self::net_setup_script(
-            &primary_mac_for_cfg,
-            &mgmt_ip,
-            cluster_ip.as_deref().zip(lan_mac_for_cfg.as_deref()),
-        )?;
+        let net_setup =
+            Self::net_setup_script(primary_mac, mgmt_ip, cluster_ip.as_deref().zip(lan_mac))?;
         cloud_init_config.write_files.push(WriteFile {
             path: "/usr/local/bin/intar-net-setup.sh".into(),
             content: net_setup,
@@ -317,14 +367,7 @@ impl ScenarioRunner {
         }
         cloud_init_config.runcmd = Some(runcmd);
 
-        cloud_init_gen.save_to_logs(&cloud_init_config, &vm_def.name, &vm.logs_dir)?;
-        cloud_init_gen.create_iso(&cloud_init_config, &vm_def.name, &vm.cloud_init_iso)?;
-
-        self.vms.insert(vm_def.name.clone(), vm);
-        self.probe_results
-            .insert(vm_def.name.clone(), HashMap::new());
-        self.vm_order.push(vm_def.name.clone());
-        Ok(())
+        Ok(cloud_init_config)
     }
 
     fn next_port(&mut self) -> Result<u16, VmError> {
@@ -335,6 +378,17 @@ impl ScenarioRunner {
             .ok_or_else(|| VmError::Qemu("No available port".into()))?;
         self.port_index += 1;
         Ok(port)
+    }
+
+    #[cfg(unix)]
+    fn host_socket_for_vm(&self, name: &str, suffix: &str) -> HostSocket {
+        HostSocket::unix(self.work_dir.join(format!("{name}-{suffix}.sock")))
+    }
+
+    #[cfg(windows)]
+    fn host_socket_for_vm(&mut self, _name: &str, _suffix: &str) -> Result<HostSocket, VmError> {
+        let port = self.next_port()?;
+        Ok(HostSocket::tcp(port))
     }
 
     fn base_image_for_vm(
@@ -613,7 +667,7 @@ sysctl -p /etc/sysctl.d/99-intar-no-ipv6.conf 2>/dev/null || true
         for (name, vm) in &self.vms {
             info!("Waiting for agent on VM: {}", name);
 
-            let result = timeout(Duration::from_secs(300), wait_for_agent(&vm.serial_socket)).await;
+            let result = timeout(Duration::from_secs(600), wait_for_agent(&vm.serial_socket)).await;
 
             match result {
                 Ok(Ok(())) => {
@@ -1043,10 +1097,9 @@ impl Drop for ScenarioRunner {
     }
 }
 
-async fn wait_for_agent(socket_path: &Path) -> Result<(), VmError> {
+async fn wait_for_agent(socket: &HostSocket) -> Result<(), VmError> {
     for _ in 0..60 {
-        if socket_path.exists()
-            && let Ok(mut conn) = try_connect(socket_path, 1, 0).await
+        if let Ok(mut conn) = try_connect(socket, 1, 0).await
             && conn.ping().await.is_ok()
         {
             return Ok(());

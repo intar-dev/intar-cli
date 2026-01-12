@@ -1,9 +1,7 @@
-use crate::VmError;
+use crate::{HostSocket, VmError, connect_host_socket};
 use intar_probes::{ProbeResult, ProbeSpec, Request, Response};
-use std::path::Path;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::{Duration, timeout};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,18 +22,16 @@ impl ExpectedResponse {
 }
 
 pub struct AgentConnection {
-    stream: BufReader<UnixStream>,
+    stream: BufReader<crate::HostStream>,
 }
 
 impl AgentConnection {
-    /// Open a Unix socket connection to the guest agent.
+    /// Open a host socket connection to the guest agent.
     ///
     /// # Errors
     /// Returns `VmError::Serial` when the socket cannot be opened.
-    pub async fn connect(socket_path: &Path) -> Result<Self, VmError> {
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .map_err(|e| VmError::Serial(format!("Failed to connect to socket: {e}")))?;
+    pub async fn connect(socket: &HostSocket) -> Result<Self, VmError> {
+        let stream = connect_host_socket(socket).await?;
 
         Ok(Self {
             stream: BufReader::new(stream),
@@ -180,12 +176,12 @@ impl AgentConnection {
 /// # Errors
 /// Returns the last `VmError` if all attempts fail.
 pub async fn try_connect(
-    socket_path: &Path,
+    socket: &HostSocket,
     retries: u32,
     delay_ms: u64,
 ) -> Result<AgentConnection, VmError> {
     for i in 0..retries {
-        match AgentConnection::connect(socket_path).await {
+        match AgentConnection::connect(socket).await {
             Ok(conn) => return Ok(conn),
             Err(e) => {
                 if i < retries - 1 {

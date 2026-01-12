@@ -9,6 +9,28 @@ pub struct CloudInitGenerator {
     pub agent_binary: Vec<u8>,
 }
 
+const DEFAULT_MASK_UNITS: &[&str] = &[
+    "apt-daily.service",
+    "apt-daily.timer",
+    "apt-daily-upgrade.service",
+    "apt-daily-upgrade.timer",
+    "motd-news.service",
+    "motd-news.timer",
+    "unattended-upgrades.service",
+    "man-db.service",
+    "man-db.timer",
+    "fstrim.service",
+    "fstrim.timer",
+    "e2scrub_all.service",
+    "e2scrub_all.timer",
+    "ua-timer.service",
+    "ua-timer.timer",
+    "snapd.service",
+    "snapd.socket",
+    "snapd.seeded.service",
+    "snapd.autoimport.service",
+];
+
 impl CloudInitGenerator {
     #[must_use]
     pub fn new(ssh_public_key: String, agent_binary: Vec<u8>) -> Self {
@@ -28,6 +50,8 @@ impl CloudInitGenerator {
         let mut user_data = String::from("#cloud-config\n");
 
         let _ = writeln!(user_data, "hostname: {hostname}");
+        user_data.push_str("package_update: false\n");
+        user_data.push_str("package_upgrade: false\n");
 
         user_data.push_str("users:\n");
         user_data.push_str("  - name: user\n");
@@ -97,6 +121,17 @@ impl CloudInitGenerator {
         user_data.push_str("  - grep -qxF /usr/local/bin/intar-shell /etc/shells || echo /usr/local/bin/intar-shell >> /etc/shells\n");
         user_data.push_str("  - systemctl enable intar-agent\n");
         user_data.push_str("  - systemctl start intar-agent\n");
+        user_data.push_str("  - |\n");
+        user_data.push_str("      if command -v systemctl >/dev/null 2>&1; then\n");
+        user_data.push_str("        for unit in");
+        for unit in DEFAULT_MASK_UNITS {
+            let _ = write!(user_data, " {unit}");
+        }
+        user_data.push_str(";\n");
+        user_data.push_str("        do\n");
+        user_data.push_str("          systemctl mask \"$unit\" || true\n");
+        user_data.push_str("        done\n");
+        user_data.push_str("      fi\n");
 
         if let Some(runcmd) = &config.runcmd {
             for line in runcmd.lines() {
@@ -192,6 +227,14 @@ impl CloudInitGenerator {
             )
         })
         .or_else(|_| {
+            Self::try_xorriso(
+                output_path,
+                &user_data_path,
+                &meta_data_path,
+                network_config_path.as_deref(),
+            )
+        })
+        .or_else(|_| {
             Self::try_hdiutil(
                 output_path,
                 &user_data_path,
@@ -199,9 +242,11 @@ impl CloudInitGenerator {
                 network_config_path.as_deref(),
             )
         })
-            .map_err(|_| VmError::CloudInit(
-                "No ISO creation tool available. Install one of: cloud-localds, mkisofs (brew install cdrtools), or genisoimage".into()
-            ))
+        .map_err(|_| {
+            VmError::CloudInit(
+                "No ISO creation tool available. Install one of: cloud-localds, mkisofs (brew install cdrtools), genisoimage, or xorriso".into(),
+            )
+        })
     }
 
     fn try_cloud_localds(
@@ -300,6 +345,44 @@ impl CloudInitGenerator {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(VmError::CloudInit(format!("genisoimage failed: {stderr}")))
+        }
+    }
+
+    fn try_xorriso(
+        output_path: &Path,
+        user_data_path: &Path,
+        meta_data_path: &Path,
+        network_config_path: Option<&Path>,
+    ) -> Result<(), VmError> {
+        let output_str = path_to_str(output_path)?;
+        let user_data_str = path_to_str(user_data_path)?;
+        let meta_data_str = path_to_str(meta_data_path)?;
+        let mut args: Vec<String> = vec![
+            "-as".into(),
+            "mkisofs".into(),
+            "-output".into(),
+            output_str.into(),
+            "-volid".into(),
+            "cidata".into(),
+            "-joliet".into(),
+            "-rock".into(),
+            user_data_str.into(),
+            meta_data_str.into(),
+        ];
+        if let Some(network_cfg) = network_config_path {
+            args.push(path_to_str(network_cfg)?.into());
+        }
+
+        let output = Command::new("xorriso")
+            .args(&args)
+            .output()
+            .map_err(|e| VmError::CloudInit(e.to_string()))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(VmError::CloudInit(format!("xorriso failed: {stderr}")))
         }
     }
 

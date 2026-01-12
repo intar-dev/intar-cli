@@ -1,7 +1,10 @@
 use crossterm::tty::IsTty;
 use ratatui::style::Color;
 use std::env;
-use std::io::{self, Write};
+use std::io;
+
+#[cfg(unix)]
+use std::io::Write;
 use std::time::Duration;
 
 #[cfg(unix)]
