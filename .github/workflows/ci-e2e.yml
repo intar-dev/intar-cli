@@ -48,6 +48,7 @@ jobs:
 
   check:
     name: Check - ${{ matrix.platform.os-name }}
+    if: github.event_name == 'pull_request'
     needs: prebuild-agents
     env:
       INTAR_AGENT_X86_64_PATH: ${{ github.workspace }}/prebuilt-agents/intar-agent-x86_64
@@ -118,7 +119,7 @@ jobs:
         shell: pwsh
         run: just check
 
-  cross-compile:
+  build:
     name: Build - ${{ matrix.platform.os-name }}
     if: github.ref == 'refs/heads/main'
     needs: prebuild-agents
@@ -167,9 +168,36 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: Add target
-        run: rustup target add ${{ matrix.platform.target }}
+      - name: Add targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl ${{ matrix.platform.target }}
+
+      - name: Install just
+        if: runner.os != 'Windows'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Install just (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install just -y
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run just check (Unix)
+        if: runner.os != 'Windows'
+        run: just check
+
+      - name: Run just check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: just check
 
       - name: Build binary
         uses: houseabsolute/actions-rust-cross@v1
