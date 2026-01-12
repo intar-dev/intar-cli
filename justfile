@@ -1,6 +1,7 @@
 # Task recipes for intar workspace
 
-set shell := ["/bin/bash", "-c"]
+set shell := ["bash", "-c"]
+set windows-shell := ["pwsh", "-NoProfile", "-Command"]
 
 check:
 	cargo fmt --all -- --check

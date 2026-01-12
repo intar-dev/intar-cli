@@ -1,4 +1,4 @@
-use crate::{VmError, VmState, path_to_str};
+use crate::{HostSocket, VmError, VmState, connect_host_socket, path_to_str};
 use intar_core::VmDefinition;
 use std::fs::File;
 use std::net::{TcpListener, UdpSocket};
@@ -7,12 +7,18 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncBufRead;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tracing::warn;
 
 const MAIN_DISK_NODE_NAME: &str = "intar_disk0";
 const CLOUD_INIT_NODE_NAME: &str = "intar_cloud_init0";
 const SNAPSHOT_JOB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SNAPSHOT_JOB_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum QemuAccel {
+    Default,
+    Tcg,
+}
 
 #[derive(Debug, Clone)]
 pub enum SharedNetworkEndpoint {
@@ -21,6 +27,22 @@ pub enum SharedNetworkEndpoint {
     /// Uses QEMU's `-netdev dgram` backend with localhost UDP sockets, so it is
     /// privilege-free and works on macOS, Linux, and Windows.
     Dgram { hub_port: u16, local_port: u16 },
+}
+
+pub struct QemuSockets {
+    pub qmp: HostSocket,
+    pub serial: HostSocket,
+    pub actions: HostSocket,
+}
+
+pub struct QemuInstanceConfig {
+    pub definition: VmDefinition,
+    pub ssh_port: u16,
+    pub mgmt_ip: String,
+    pub shared_lan: Option<SharedNetworkEndpoint>,
+    pub primary_mac: Option<String>,
+    pub lan_mac: Option<String>,
+    pub sockets: QemuSockets,
 }
 
 pub struct QemuInstance {
@@ -32,9 +54,9 @@ pub struct QemuInstance {
     pub shared_lan: Option<SharedNetworkEndpoint>,
     pub primary_mac: Option<String>,
     pub lan_mac: Option<String>,
-    pub qmp_socket: PathBuf,
-    pub serial_socket: PathBuf,
-    pub actions_socket: PathBuf,
+    pub qmp_socket: HostSocket,
+    pub serial_socket: HostSocket,
+    pub actions_socket: HostSocket,
     pub pid_file: PathBuf,
     pub disk_path: PathBuf,
     pub base_image: Option<PathBuf>,
@@ -45,29 +67,21 @@ pub struct QemuInstance {
 
 impl QemuInstance {
     #[must_use]
-    pub fn new(
-        definition: VmDefinition,
-        work_dir: &Path,
-        ssh_port: u16,
-        mgmt_ip: String,
-        shared_lan: Option<SharedNetworkEndpoint>,
-        primary_mac: Option<String>,
-        lan_mac: Option<String>,
-    ) -> Self {
-        let name = definition.name.clone();
+    pub fn new(config: QemuInstanceConfig, work_dir: &Path) -> Self {
+        let name = config.definition.name.clone();
         let logs_dir = work_dir.join("logs").join(&name);
         Self {
             name: name.clone(),
-            definition,
+            definition: config.definition,
             state: VmState::Starting,
-            ssh_port,
-            mgmt_ip,
-            shared_lan,
-            primary_mac,
-            lan_mac,
-            qmp_socket: work_dir.join(format!("{name}-qmp.sock")),
-            serial_socket: work_dir.join(format!("{name}-serial.sock")),
-            actions_socket: work_dir.join(format!("{name}-actions.sock")),
+            ssh_port: config.ssh_port,
+            mgmt_ip: config.mgmt_ip,
+            shared_lan: config.shared_lan,
+            primary_mac: config.primary_mac,
+            lan_mac: config.lan_mac,
+            qmp_socket: config.sockets.qmp,
+            serial_socket: config.sockets.serial,
+            actions_socket: config.sockets.actions,
             pid_file: work_dir.join(format!("{name}-qemu.pid")),
             disk_path: work_dir.join(format!("{name}.qcow2")),
             base_image: None,
@@ -151,14 +165,27 @@ impl QemuInstance {
     pub fn start(&mut self, arch: &str) -> Result<(), VmError> {
         std::fs::create_dir_all(&self.logs_dir)?;
 
-        let qemu_binary = Self::qemu_binary_for_arch(arch)?;
-        let mut cmd = Command::new(qemu_binary);
-        self.configure_qemu_command(&mut cmd, arch);
-        self.redirect_qemu_output(&mut cmd)?;
+        let qemu_log_path = self.logs_dir.join("qemu.log");
+        let mut child = self.spawn_qemu(arch, QemuAccel::Default, &qemu_log_path)?;
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| VmError::Qemu(format!("Failed to start QEMU: {e}")))?;
+        if let Some(reason) = Self::check_early_exit(&mut child, &qemu_log_path)? {
+            if Self::log_indicates_accel_failure(&reason) {
+                self.rotate_qemu_log(&qemu_log_path, "accel");
+                self.cleanup_runtime_files();
+                warn!(
+                    "QEMU accel unavailable for VM {}. Retrying with tcg. Error: {}",
+                    self.name,
+                    reason.lines().next().unwrap_or(&reason)
+                );
+                child = self.spawn_qemu(arch, QemuAccel::Tcg, &qemu_log_path)?;
+
+                if let Some(reason) = Self::check_early_exit(&mut child, &qemu_log_path)? {
+                    return Err(VmError::Qemu(reason));
+                }
+            } else {
+                return Err(VmError::Qemu(reason));
+            }
+        }
 
         if let Err(e) = std::fs::write(&self.pid_file, child.id().to_string()) {
             return Err(VmError::Qemu(format!(
@@ -181,25 +208,107 @@ impl QemuInstance {
         }
     }
 
-    fn configure_qemu_command(&self, cmd: &mut Command, arch: &str) {
+    fn spawn_qemu(
+        &self,
+        arch: &str,
+        accel: QemuAccel,
+        qemu_log_path: &Path,
+    ) -> Result<Child, VmError> {
+        let qemu_binary = Self::qemu_binary_for_arch(arch)?;
+        let mut cmd = Command::new(qemu_binary);
+        self.configure_qemu_command(&mut cmd, arch, accel);
+        Self::redirect_qemu_output(&mut cmd, qemu_log_path)?;
+
+        cmd.spawn()
+            .map_err(|e| VmError::Qemu(format!("Failed to start QEMU: {e}")))
+    }
+
+    fn check_early_exit(
+        child: &mut Child,
+        qemu_log_path: &Path,
+    ) -> Result<Option<String>, VmError> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let log = std::fs::read_to_string(qemu_log_path).unwrap_or_default();
+                    let log = log.trim();
+                    let reason = if log.is_empty() {
+                        format!("QEMU exited early with status {status}")
+                    } else {
+                        log.to_string()
+                    };
+                    return Ok(Some(reason));
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(VmError::Qemu(format!("Failed to check QEMU status: {e}")));
+                }
+            }
+        }
+    }
+
+    fn log_indicates_accel_failure(log: &str) -> bool {
+        let haystack = log.to_lowercase();
+        let hvf = haystack.contains("hvf") && haystack.contains("unsupported");
+        let kvm = haystack.contains("failed to initialize kvm")
+            || haystack.contains("could not access kvm kernel module")
+            || (haystack.contains("kvm") && haystack.contains("permission denied"));
+        let whpx = haystack.contains("whpx")
+            && (haystack.contains("failed")
+                || haystack.contains("not supported")
+                || haystack.contains("not present")
+                || haystack.contains("permission denied"));
+        hvf || kvm || whpx
+    }
+
+    fn rotate_qemu_log(&self, qemu_log_path: &Path, suffix: &str) {
+        if qemu_log_path.exists() {
+            let rotated = self.logs_dir.join(format!("qemu-{suffix}.log"));
+            let _ = std::fs::rename(qemu_log_path, rotated);
+        }
+    }
+
+    fn cleanup_runtime_files(&self) {
+        for socket in [&self.qmp_socket, &self.serial_socket, &self.actions_socket] {
+            if let Some(path) = socket.cleanup_path()
+                && path.exists()
+            {
+                std::fs::remove_file(path).ok();
+            }
+        }
+
+        if self.pid_file.exists() {
+            std::fs::remove_file(&self.pid_file).ok();
+        }
+    }
+
+    fn configure_qemu_command(&self, cmd: &mut Command, arch: &str, accel: QemuAccel) {
         cmd.args(["-name", &self.name]);
 
-        Self::apply_machine_args(cmd, arch);
-        self.apply_resource_args(cmd);
-        self.apply_drive_args(cmd);
+        Self::apply_machine_args(cmd, arch, accel);
+        self.apply_resource_args(cmd, accel);
+        self.apply_drive_args(cmd, accel);
         Self::apply_rng_args(cmd);
         self.apply_network_args(cmd);
         self.apply_agent_serial_args(cmd);
         self.apply_console_args(cmd);
         self.apply_qmp_args(cmd);
-        Self::apply_misc_args(cmd);
+        Self::apply_misc_args(cmd, accel);
     }
 
-    fn apply_machine_args(cmd: &mut Command, arch: &str) {
+    fn apply_machine_args(cmd: &mut Command, arch: &str, accel: QemuAccel) {
         match arch {
             "aarch64" | "arm64" => {
                 cmd.args(["-machine", "virt,highmem=on"]);
-                cmd.args(["-cpu", "host"]);
+                if accel == QemuAccel::Default {
+                    cmd.args(["-cpu", "host"]);
+                }
 
                 let efi_paths = [
                     "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
@@ -212,23 +321,39 @@ impl QemuInstance {
             }
             "x86_64" | "amd64" => {
                 cmd.args(["-machine", "q35"]);
-                cmd.args(["-cpu", "host"]);
+                match accel {
+                    QemuAccel::Default => cmd.args(["-cpu", "host"]),
+                    QemuAccel::Tcg => cmd.args(["-cpu", "qemu64"]),
+                };
             }
             _ => {}
         }
     }
 
-    fn apply_resource_args(&self, cmd: &mut Command) {
+    fn apply_resource_args(&self, cmd: &mut Command, accel: QemuAccel) {
         cmd.args(["-m", &format!("{}M", self.definition.memory)]);
-        cmd.args(["-smp", &self.definition.cpu.to_string()]);
+        let mut cpu = self.definition.cpu;
+        if accel == QemuAccel::Tcg && cpu != 3 {
+            warn!(
+                "Reducing vCPU count from {} to 3 for VM {} under TCG",
+                cpu, self.name
+            );
+            cpu = 3;
+        }
+        cmd.args(["-smp", &cpu.to_string()]);
     }
 
-    fn apply_drive_args(&self, cmd: &mut Command) {
+    fn apply_drive_args(&self, cmd: &mut Command, accel: QemuAccel) {
+        let cache = if accel == QemuAccel::Tcg {
+            ",cache=unsafe"
+        } else {
+            ""
+        };
         cmd.args([
             "-drive",
             &format!(
-                "file={},format=qcow2,if=virtio,node-name={MAIN_DISK_NODE_NAME}",
-                self.disk_path.display()
+                "file={},format=qcow2,if=virtio,node-name={MAIN_DISK_NODE_NAME}{cache}",
+                self.disk_path.display(),
             ),
         ]);
 
@@ -287,22 +412,10 @@ impl QemuInstance {
 
     fn apply_agent_serial_args(&self, cmd: &mut Command) {
         cmd.args(["-device", "virtio-serial-pci,id=virtio-serial0"]);
-        cmd.args([
-            "-chardev",
-            &format!(
-                "socket,id=agent,path={},server=on,wait=off",
-                self.serial_socket.display()
-            ),
-        ]);
+        cmd.args(["-chardev", &self.serial_socket.chardev_arg("agent")]);
         cmd.args(["-device", "virtserialport,chardev=agent,name=intar.agent"]);
 
-        cmd.args([
-            "-chardev",
-            &format!(
-                "socket,id=actions,path={},server=on,wait=off",
-                self.actions_socket.display()
-            ),
-        ]);
+        cmd.args(["-chardev", &self.actions_socket.chardev_arg("actions")]);
         cmd.args([
             "-device",
             "virtserialport,chardev=actions,name=intar.actions",
@@ -319,26 +432,31 @@ impl QemuInstance {
     }
 
     fn apply_qmp_args(&self, cmd: &mut Command) {
-        cmd.args([
-            "-qmp",
-            &format!("unix:{},server,nowait", self.qmp_socket.display()),
-        ]);
+        cmd.args(["-qmp", &self.qmp_socket.qmp_arg()]);
     }
 
-    fn apply_misc_args(cmd: &mut Command) {
+    fn apply_misc_args(cmd: &mut Command, accel: QemuAccel) {
         cmd.args(["-display", "none"]);
 
-        if cfg!(target_os = "macos") {
-            cmd.args(["-accel", "hvf"]);
-        } else if cfg!(target_os = "linux") {
-            cmd.args(["-enable-kvm"]);
+        match accel {
+            QemuAccel::Tcg => {
+                cmd.args(["-accel", "tcg,thread=multi"]);
+            }
+            QemuAccel::Default => {
+                if cfg!(target_os = "windows") {
+                    cmd.args(["-accel", "whpx"]);
+                } else if cfg!(target_os = "macos") {
+                    cmd.args(["-accel", "hvf"]);
+                } else if cfg!(target_os = "linux") {
+                    cmd.args(["-enable-kvm"]);
+                }
+            }
         }
     }
 
-    fn redirect_qemu_output(&self, cmd: &mut Command) -> Result<(), VmError> {
-        let qemu_log_path = self.logs_dir.join("qemu.log");
-        let qemu_log = File::create(&qemu_log_path)
-            .map_err(|e| VmError::Qemu(format!("Failed to create qemu.log: {e}")))?;
+    fn redirect_qemu_output(cmd: &mut Command, qemu_log_path: &Path) -> Result<(), VmError> {
+        let qemu_log = File::create(qemu_log_path)
+            .map_err(|e| VmError::Qemu(format!("Failed to create qemu log: {e}")))?;
         let qemu_log_err = qemu_log
             .try_clone()
             .map_err(|e| VmError::Qemu(format!("Failed to clone log file handle: {e}")))?;
@@ -359,11 +477,11 @@ impl QemuInstance {
         command: &str,
         args: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, VmError> {
-        let stream = UnixStream::connect(&self.qmp_socket)
+        let stream = connect_host_socket(&self.qmp_socket)
             .await
             .map_err(|e| VmError::Qmp(format!("Failed to connect to QMP: {e}")))?;
 
-        let (read_half, mut write_half) = stream.into_split();
+        let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
 
         let _greeting = Self::read_qmp_greeting(&mut reader).await?;
@@ -629,15 +747,16 @@ impl QemuInstance {
             }
         }
 
-        for path in [
-            &self.qmp_socket,
-            &self.serial_socket,
-            &self.actions_socket,
-            &self.pid_file,
-        ] {
-            if path.exists() {
+        for socket in [&self.qmp_socket, &self.serial_socket, &self.actions_socket] {
+            if let Some(path) = socket.cleanup_path()
+                && path.exists()
+            {
                 std::fs::remove_file(path).ok();
             }
+        }
+
+        if self.pid_file.exists() {
+            std::fs::remove_file(&self.pid_file).ok();
         }
 
         Ok(())

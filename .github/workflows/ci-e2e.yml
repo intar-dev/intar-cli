@@ -1,0 +1,254 @@
+name: build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  prebuild-agents:
+    name: Prebuild Agents
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Add musl targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Install cargo-zigbuild (pip)
+        run: |
+          python -m pip install --user cargo-zigbuild
+          echo "$(python -m site --user-base)/bin" >> "$GITHUB_PATH"
+
+      - name: Build intar-agent (musl)
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-musl -p intar-agent
+          cargo zigbuild --release --target aarch64-unknown-linux-musl -p intar-agent
+
+      - name: Stage prebuilt agents
+        run: |
+          mkdir -p prebuilt-agents
+          cp target/x86_64-unknown-linux-musl/release/intar-agent prebuilt-agents/intar-agent-x86_64
+          cp target/aarch64-unknown-linux-musl/release/intar-agent prebuilt-agents/intar-agent-aarch64
+
+      - name: Upload prebuilt agents
+        uses: actions/upload-artifact@v4
+        with:
+          name: intar-agent-musl
+          path: prebuilt-agents
+
+  check:
+    name: Check - ${{ matrix.platform.os-name }}
+    needs: prebuild-agents
+    env:
+      INTAR_AGENT_X86_64_PATH: ${{ github.workspace }}/prebuilt-agents/intar-agent-x86_64
+      INTAR_AGENT_AARCH64_PATH: ${{ github.workspace }}/prebuilt-agents/intar-agent-aarch64
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os-name: Linux-x86_64
+            runs-on: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os-name: Linux-aarch64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os-name: macOS-x86_64
+            runs-on: macos-15-intel
+            target: x86_64-apple-darwin
+          - os-name: macOS-aarch64
+            runs-on: macos-26
+            target: aarch64-apple-darwin
+          - os-name: Windows-x86_64
+            runs-on: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os-name: Windows-aarch64
+            runs-on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform.runs-on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download prebuilt agents
+        uses: actions/download-artifact@v4
+        with:
+          name: intar-agent-musl
+          path: prebuilt-agents
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Add musl targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Install just
+        if: runner.os != 'Windows'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Install just (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install just -y
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run just check (Unix)
+        if: runner.os != 'Windows'
+        run: just check
+
+      - name: Run just check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: just check
+
+  cross-compile:
+    name: Build - ${{ matrix.platform.os-name }}
+    if: github.ref == 'refs/heads/main'
+    needs: prebuild-agents
+    env:
+      INTAR_AGENT_X86_64_PATH: ${{ github.workspace }}/prebuilt-agents/intar-agent-x86_64
+      INTAR_AGENT_AARCH64_PATH: ${{ github.workspace }}/prebuilt-agents/intar-agent-aarch64
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os-name: Linux-x86_64
+            runs-on: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            bin: intar
+          - os-name: Linux-aarch64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            bin: intar
+          - os-name: macOS-x86_64
+            runs-on: macos-15-intel
+            target: x86_64-apple-darwin
+            bin: intar
+          - os-name: macOS-aarch64
+            runs-on: macos-26
+            target: aarch64-apple-darwin
+            bin: intar
+          - os-name: Windows-x86_64
+            runs-on: windows-2025
+            target: x86_64-pc-windows-msvc
+            bin: intar.exe
+          - os-name: Windows-aarch64
+            runs-on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bin: intar.exe
+
+    runs-on: ${{ matrix.platform.runs-on }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download prebuilt agents
+        uses: actions/download-artifact@v4
+        with:
+          name: intar-agent-musl
+          path: prebuilt-agents
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add target
+        run: rustup target add ${{ matrix.platform.target }}
+
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.platform.target }}
+          args: "--locked --release --package intar-cli --bin intar"
+          strip: true
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: intar-${{ matrix.platform.os-name }}
+          path: target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}
+
+  e2e:
+    name: E2E - ${{ matrix.os-name }}
+    if: github.event_name == 'pull_request'
+    needs: prebuild-agents
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os-name: Linux
+            runs-on: ubuntu-24.04
+          - os-name: macOS-Intel
+            runs-on: macos-15-intel
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      RUST_BACKTRACE: "1"
+      INTAR_AGENT_X86_64_PATH: ${{ github.workspace }}/prebuilt-agents/intar-agent-x86_64
+      INTAR_AGENT_AARCH64_PATH: ${{ github.workspace }}/prebuilt-agents/intar-agent-aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download prebuilt agents
+        uses: actions/download-artifact@v4
+        with:
+          name: intar-agent-musl
+          path: prebuilt-agents
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add musl targets
+        run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils tmux
+
+      - name: Enable KVM group perms
+        if: runner.os == 'Linux'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Check KVM access
+        if: runner.os == 'Linux'
+        run: |
+          ls -la /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install qemu tmux
+
+      - name: Build intar
+        run: cargo build --bin intar
+
+      - name: Run e2e
+        run: bash scripts/e2e-nginx.sh

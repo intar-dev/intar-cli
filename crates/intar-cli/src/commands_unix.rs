@@ -3,6 +3,8 @@ use anyhow::{Context, Result, bail};
 use intar_core::Scenario;
 use intar_ui::App;
 use intar_vm::IntarDirs;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 pub async fn start(scenario_path: PathBuf) -> Result<()> {
@@ -28,7 +30,7 @@ pub async fn start(scenario_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub fn ssh(vm_name: &str, run_name: Option<&str>) -> Result<()> {
+pub fn ssh(vm_name: &str, run_name: Option<&str>, command: Option<&str>) -> Result<()> {
     let dirs = IntarDirs::new().context("Failed to initialize directories")?;
     let runs_root = dirs.runs_dir();
 
@@ -84,22 +86,32 @@ pub fn ssh(vm_name: &str, run_name: Option<&str>) -> Result<()> {
         bail!("SSH key not found at {}", ssh_key.display());
     }
 
-    let status = std::process::Command::new("ssh")
-        .args([
-            "-i",
-            &ssh_key.to_string_lossy(),
-            "-p",
-            &vm_info.ssh_port.to_string(),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "LogLevel=ERROR",
-            "user@localhost",
-        ])
-        .status()
-        .context("Failed to execute ssh")?;
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args([
+        "-i",
+        &ssh_key.to_string_lossy(),
+        "-p",
+        &vm_info.ssh_port.to_string(),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+        "user@localhost",
+    ]);
+
+    if let Some(command) = command {
+        cmd.arg(command);
+    }
+
+    let status = cmd.status().context("Failed to execute ssh")?;
 
     if !status.success() {
         bail!("SSH exited with status: {status}");
@@ -200,9 +212,31 @@ pub fn logs(run_name: Option<&str>, vm_name: Option<&str>, log_type: &str) -> Re
         bail!("Log file not found: {}", log_file.display());
     }
 
-    println!("=== {} ===\n", log_file.display());
-    let content = std::fs::read_to_string(&log_file)?;
-    print!("{content}");
+    let header = format!("=== {} ===\n\n", log_file.display());
+    write_stdout_all(header.as_bytes())?;
+
+    let file = File::open(&log_file)?;
+    copy_to_stdout(file)?;
 
     Ok(())
+}
+
+fn write_stdout_all(bytes: &[u8]) -> Result<()> {
+    let mut stdout = io::stdout();
+    if let Err(e) = stdout.write_all(bytes) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+fn copy_to_stdout(mut file: File) -> Result<()> {
+    let mut stdout = io::stdout();
+    match io::copy(&mut file, &mut stdout) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
