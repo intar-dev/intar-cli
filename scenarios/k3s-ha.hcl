@@ -92,6 +92,13 @@ export K3S_TOKEN="intar-cluster-token"
 
 ip link set "$CLUSTER_IF" up || true
 
+mkdir -p /etc/rancher/k3s
+cat > /etc/rancher/k3s/registries.yaml <<'REGISTRY_EOF'
+mirrors:
+  docker.io:
+  registry.k8s.io:
+REGISTRY_EOF
+
 # Most Ubuntu cloud images ship curl; install only if missing to avoid slow apt runs.
 if ! command -v curl >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
@@ -108,7 +115,7 @@ for _ in $(seq 1 30); do
 done
 [ -n "$NODE_IP" ] || { echo "No IPv4 on $CLUSTER_IF"; exit 1; }
 
-COMMON_ARGS="server --flannel-iface $CLUSTER_IF --node-ip $NODE_IP --advertise-address $NODE_IP --tls-san $HOSTNAME --tls-san $HOSTNAME.intar --tls-san k3s-server --tls-san k3s-server.intar"
+COMMON_ARGS="server --embedded-registry --flannel-iface $CLUSTER_IF --node-ip $NODE_IP --advertise-address $NODE_IP --tls-san $HOSTNAME --tls-san $HOSTNAME.intar --tls-san k3s-server --tls-san k3s-server.intar"
 
 if [ "$HOSTNAME" = "k3s-1" ]; then
   curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="$COMMON_ARGS --cluster-init" sh -
@@ -185,6 +192,13 @@ export K3S_TOKEN="intar-cluster-token"
 
 ip link set "$CLUSTER_IF" up || true
 
+mkdir -p /etc/rancher/k3s
+cat > /etc/rancher/k3s/registries.yaml <<'REGISTRY_EOF'
+mirrors:
+  docker.io:
+  registry.k8s.io:
+REGISTRY_EOF
+
 if ! command -v curl >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
@@ -199,7 +213,7 @@ for _ in $(seq 1 30); do
 done
 [ -n "$NODE_IP" ] || { echo "No IPv4 on $CLUSTER_IF"; exit 1; }
 
-COMMON_ARGS="server --flannel-iface $CLUSTER_IF --node-ip $NODE_IP --advertise-address $NODE_IP --tls-san $HOSTNAME --tls-san $HOSTNAME.intar --tls-san k3s-server --tls-san k3s-server.intar"
+COMMON_ARGS="server --embedded-registry --flannel-iface $CLUSTER_IF --node-ip $NODE_IP --advertise-address $NODE_IP --tls-san $HOSTNAME --tls-san $HOSTNAME.intar --tls-san k3s-server --tls-san k3s-server.intar"
 
 if [ "$HOSTNAME" = "k3s-1" ]; then
   curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="$COMMON_ARGS --cluster-init" sh -
@@ -239,6 +253,13 @@ export K3S_TOKEN="intar-cluster-token"
 
 ip link set "$CLUSTER_IF" up || true
 
+mkdir -p /etc/rancher/k3s
+cat > /etc/rancher/k3s/registries.yaml <<'REGISTRY_EOF'
+mirrors:
+  docker.io:
+  registry.k8s.io:
+REGISTRY_EOF
+
 if ! command -v curl >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
@@ -253,7 +274,7 @@ for _ in $(seq 1 30); do
 done
 [ -n "$NODE_IP" ] || { echo "No IPv4 on $CLUSTER_IF"; exit 1; }
 
-COMMON_ARGS="server --flannel-iface $CLUSTER_IF --node-ip $NODE_IP --advertise-address $NODE_IP --tls-san $HOSTNAME --tls-san $HOSTNAME.intar --tls-san k3s-server --tls-san k3s-server.intar"
+COMMON_ARGS="server --embedded-registry --flannel-iface $CLUSTER_IF --node-ip $NODE_IP --advertise-address $NODE_IP --tls-san $HOSTNAME --tls-san $HOSTNAME.intar --tls-san k3s-server --tls-san k3s-server.intar"
 
 if [ "$HOSTNAME" = "k3s-1" ]; then
   curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="$COMMON_ARGS --cluster-init" sh -

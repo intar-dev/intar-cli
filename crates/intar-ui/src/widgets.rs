@@ -169,8 +169,7 @@ impl CompletedScreen<'_> {
     fn render_footer(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .padding(Padding::uniform(1))
-            .border_type(BorderType::Plain)
+            .border_type(BorderType::Thick)
             .border_style(Style::default().fg(self.theme.border))
             .style(Style::default().bg(self.theme.surface));
 
@@ -190,23 +189,30 @@ impl CompletedScreen<'_> {
                 .bold()
         };
 
-        let spans = vec![
-            Span::styled(" Q ", key_style),
-            Span::raw(" quit   "),
-            Span::styled(" R ", key_style),
-            Span::raw(" reset   "),
-            Span::styled(" T ", key_style),
-            Span::raw(" theme"),
+        let keys = vec![
+            ("?", "Help"),
+            ("R", "Restart"),
+            ("T", "Theme"),
+            ("Q", "Quit"),
         ];
 
+        let mut spans = Vec::new();
+        for (key, desc) in keys {
+            spans.push(Span::styled(format!(" {key} "), key_style));
+            spans.push(Span::styled(
+                format!(" {desc} "),
+                Style::default().fg(self.theme.dim),
+            ));
+            spans.push(Span::raw(" "));
+        }
+
+        let content_area = Layout::vertical([Constraint::Length(1)])
+            .flex(ratatui::layout::Flex::Center)
+            .split(inner)[0];
+
         Paragraph::new(Line::from(spans))
-            .alignment(Alignment::Center)
-            .style(
-                Style::default()
-                    .fg(self.theme.secondary)
-                    .bg(self.theme.surface),
-            )
-            .render(inner, buf);
+            .alignment(Alignment::Left)
+            .render(content_area, buf);
     }
 }
 
@@ -670,7 +676,7 @@ impl ScenarioTreeScreen<'_> {
             ("PGUP/PGDN", "Scroll"),
             ("?", "Help"),
             ("T", "Theme"),
-            ("R", "Reset"),
+            ("R", "Restart"),
             ("Q", "Quit"),
         ];
 
@@ -928,7 +934,7 @@ impl Widget for HelpOverlay<'_> {
             ]),
             Line::from(vec![
                 Span::styled(" R ", key_style),
-                Span::raw(" Reset scenario"),
+                Span::raw(" Restart scenario"),
             ]),
             Line::from(vec![
                 Span::styled(" T ", key_style),
