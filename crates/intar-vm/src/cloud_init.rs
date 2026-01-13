@@ -119,8 +119,6 @@ impl CloudInitGenerator {
         user_data.push_str("runcmd:\n");
         user_data.push_str("  - systemctl daemon-reload\n");
         user_data.push_str("  - grep -qxF /usr/local/bin/intar-shell /etc/shells || echo /usr/local/bin/intar-shell >> /etc/shells\n");
-        user_data.push_str("  - systemctl enable intar-agent\n");
-        user_data.push_str("  - systemctl start intar-agent\n");
         user_data.push_str("  - |\n");
         user_data.push_str("      if command -v systemctl >/dev/null 2>&1; then\n");
         user_data.push_str("        for unit in");
@@ -141,6 +139,9 @@ impl CloudInitGenerator {
                 }
             }
         }
+
+        user_data.push_str("  - systemctl enable intar-agent\n");
+        user_data.push_str("  - systemctl start intar-agent\n");
 
         user_data
     }
