@@ -1009,8 +1009,8 @@ impl App {
     fn draw_overlays(&self, f: &mut ratatui::Frame, area: Rect) {
         if self.flags.show_confirm_reset {
             let dialog = ConfirmDialog {
-                title: "Reset Scenario",
-                message: "Reset scenario to initial state?\nAll progress will be lost.",
+                title: "Restart Scenario",
+                message: "Restart scenario from the initial state?\nAll progress will be lost.",
                 theme: &self.theme,
             };
             f.render_widget(dialog, area);

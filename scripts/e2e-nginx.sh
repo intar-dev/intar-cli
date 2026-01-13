@@ -158,7 +158,7 @@ fi
 echo "Waiting for break-nginx step..."
 break_ready=""
 for _ in $(seq 1 "$max_attempts"); do
-  if "$INTAR_BIN" ssh webserver --command "sudo -n test -f /var/log/intar/step-webserver-break-nginx.log && sudo -n grep -q \"step webserver/break-nginx complete\" /var/log/intar/step-webserver-break-nginx.log" >/dev/null 2>&1; then
+  if "$INTAR_BIN" ssh webserver --command 'sudo -n systemctl is-active --quiet nginx; svc=$?; test ! -f /etc/nginx/sites-enabled/default; file=$?; [ $svc -ne 0 ] && [ $file -eq 0 ]' >/dev/null 2>&1; then
     break_ready="yes"
     break
   fi
@@ -167,6 +167,24 @@ done
 
 if [[ -z "$break_ready" ]]; then
   echo "break-nginx step did not finish in time."
+  "$INTAR_BIN" logs --vm webserver --log-type console || true
+  "${TMUX_CMD[@]}" capture-pane -pt "$SESSION_NAME" -S -2000 > "$UI_LOG" 2>/dev/null || true
+  snapshot_logs
+  exit 1
+fi
+
+echo "Checking break traces..."
+trace_ok=""
+for _ in $(seq 1 "$max_attempts"); do
+  if "$INTAR_BIN" ssh webserver --command "sudo -n test ! -f /var/log/intar/step-webserver-break-nginx.log && test ! -f /usr/local/bin/intar-step-webserver-break-nginx.sh && test ! -f /run/intar-step-webserver-break-nginx.sh" >/dev/null 2>&1; then
+    trace_ok="yes"
+    break
+  fi
+  sleep "$poll_secs"
+done
+
+if [[ -z "$trace_ok" ]]; then
+  echo "Break traces were detected on the VM."
   "$INTAR_BIN" logs --vm webserver --log-type console || true
   "${TMUX_CMD[@]}" capture-pane -pt "$SESSION_NAME" -S -2000 > "$UI_LOG" 2>/dev/null || true
   snapshot_logs

@@ -21,8 +21,13 @@ pub fn apply_vm_steps_to_cloud_init(
 
     for step in steps {
         let step_slug = slugify(&step.name);
-        let script_path = format!("/usr/local/bin/intar-step-{vm_slug}-{step_slug}.sh");
-        let script = render_step_script(&vm_slug, &step_slug, step)?;
+        let hidden = is_hidden_step(step);
+        let script_path = if hidden {
+            format!("/run/intar-step-{vm_slug}-{step_slug}.sh")
+        } else {
+            format!("/usr/local/bin/intar-step-{vm_slug}-{step_slug}.sh")
+        };
+        let script = render_step_script(&vm_slug, &step_slug, step, hidden)?;
 
         config.write_files.push(WriteFile {
             path: script_path.clone(),
@@ -30,60 +35,93 @@ pub fn apply_vm_steps_to_cloud_init(
             permissions: Some("0755".into()),
         });
 
-        append_runcmd_line(
-            &mut runcmd,
-            &format!("cloud-init-per once intar-step-{vm_slug}-{step_slug} {script_path}"),
-        );
+        if hidden {
+            append_runcmd_line(&mut runcmd, &format!("bash {script_path}"));
+        } else {
+            append_runcmd_line(
+                &mut runcmd,
+                &format!("cloud-init-per once intar-step-{vm_slug}-{step_slug} {script_path}"),
+            );
+        }
     }
 
     config.runcmd = Some(runcmd);
     Ok(())
 }
 
-fn render_step_script(vm_slug: &str, step_slug: &str, step: &VmStep) -> Result<String, VmError> {
+fn render_step_script(
+    vm_slug: &str,
+    step_slug: &str,
+    step: &VmStep,
+    hidden: bool,
+) -> Result<String, VmError> {
     let mut script = String::new();
 
-    render_step_header(&mut script, vm_slug, step_slug)?;
+    render_step_header(&mut script, vm_slug, step_slug, hidden)?;
 
     for (idx, action) in step.actions.iter().enumerate() {
         render_action(&mut script, step_slug, idx, action)?;
     }
 
-    render_step_footer(&mut script, vm_slug, step_slug)?;
+    render_step_footer(&mut script, vm_slug, step_slug, hidden)?;
 
     Ok(script)
 }
 
-fn render_step_header(script: &mut String, vm_slug: &str, step_slug: &str) -> Result<(), VmError> {
+fn render_step_header(
+    script: &mut String,
+    vm_slug: &str,
+    step_slug: &str,
+    hidden: bool,
+) -> Result<(), VmError> {
     writeln!(script, "#!/usr/bin/env bash")
         .map_err(|_| VmError::CloudInit("format error".into()))?;
     writeln!(script, "set -euo pipefail").map_err(|_| VmError::CloudInit("format error".into()))?;
 
-    writeln!(script, "LOG_DIR=/var/log/intar")
+    if hidden {
+        writeln!(script, "trap 'rm -f -- \"$0\"' EXIT")
+            .map_err(|_| VmError::CloudInit("format error".into()))?;
+        writeln!(script, "exec >/dev/null 2>&1")
+            .map_err(|_| VmError::CloudInit("format error".into()))?;
+    } else {
+        writeln!(script, "LOG_DIR=/var/log/intar")
+            .map_err(|_| VmError::CloudInit("format error".into()))?;
+        writeln!(script, "mkdir -p \"$LOG_DIR\"")
+            .map_err(|_| VmError::CloudInit("format error".into()))?;
+        writeln!(
+            script,
+            "exec >\"$LOG_DIR/step-{vm_slug}-{step_slug}.log\" 2>&1"
+        )
         .map_err(|_| VmError::CloudInit("format error".into()))?;
-    writeln!(script, "mkdir -p \"$LOG_DIR\"")
+        writeln!(
+            script,
+            "echo \"[intar] step {vm_slug}/{step_slug} starting\""
+        )
         .map_err(|_| VmError::CloudInit("format error".into()))?;
-    writeln!(
-        script,
-        "exec >\"$LOG_DIR/step-{vm_slug}-{step_slug}.log\" 2>&1"
-    )
-    .map_err(|_| VmError::CloudInit("format error".into()))?;
-    writeln!(
-        script,
-        "echo \"[intar] step {vm_slug}/{step_slug} starting\""
-    )
-    .map_err(|_| VmError::CloudInit("format error".into()))?;
+    }
 
     Ok(())
 }
 
-fn render_step_footer(script: &mut String, vm_slug: &str, step_slug: &str) -> Result<(), VmError> {
-    writeln!(
-        script,
-        "echo \"[intar] step {vm_slug}/{step_slug} complete\""
-    )
-    .map_err(|_| VmError::CloudInit("format error".into()))?;
+fn render_step_footer(
+    script: &mut String,
+    vm_slug: &str,
+    step_slug: &str,
+    hidden: bool,
+) -> Result<(), VmError> {
+    if !hidden {
+        writeln!(
+            script,
+            "echo \"[intar] step {vm_slug}/{step_slug} complete\""
+        )
+        .map_err(|_| VmError::CloudInit("format error".into()))?;
+    }
     Ok(())
+}
+
+fn is_hidden_step(step: &VmStep) -> bool {
+    let name = step.name.to_lowercase();
+    name.starts_with("break") || name.contains("break-") || name.contains("break_")
 }
 
 fn render_action(
@@ -497,16 +535,16 @@ mod tests {
 
         let runcmd = config.runcmd.as_deref().unwrap();
         assert!(runcmd.contains("echo pre"));
-        assert!(runcmd.contains(
-            "cloud-init-per once intar-step-web-break-nginx /usr/local/bin/intar-step-web-break-nginx.sh"
-        ));
+        assert!(runcmd.contains("bash /run/intar-step-web-break-nginx.sh"));
 
         let script = config
             .write_files
             .iter()
-            .find(|f| f.path == "/usr/local/bin/intar-step-web-break-nginx.sh")
+            .find(|f| f.path == "/run/intar-step-web-break-nginx.sh")
             .map(|f| f.content.as_str())
             .unwrap();
+        assert!(script.contains("trap 'rm -f -- \"$0\"' EXIT"));
+        assert!(script.contains("exec >/dev/null 2>&1"));
         assert!(script.contains("systemctl stop 'nginx'"));
         assert!(script.contains("rm -f -- '/etc/nginx/sites-enabled/default'"));
         assert!(script.contains("export KUBECONFIG='/etc/rancher/k3s/k3s.yaml'"));
