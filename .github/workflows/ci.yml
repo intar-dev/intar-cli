@@ -209,19 +209,33 @@ jobs:
           args: "--locked --release --package intar-cli --bin intar"
           strip: true
 
+      - name: Prepare binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.platform.target }}/release/intar dist/intar-${{ matrix.platform.target }}
+          chmod +x dist/intar-${{ matrix.platform.target }}
+
+      - name: Prepare binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target\\${{ matrix.platform.target }}\\release\\intar.exe" "dist\\intar-${{ matrix.platform.target }}.exe"
+
       - name: Upload binary (Unix)
         if: runner.os != 'Windows'
         uses: actions/upload-artifact@v6
         with:
           name: intar-${{ matrix.platform.target }}
-          path: target/${{ matrix.platform.target }}/release/intar
+          path: dist/intar-${{ matrix.platform.target }}
 
       - name: Upload binary (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v6
         with:
           name: intar-${{ matrix.platform.target }}
-          path: target/${{ matrix.platform.target }}/release/intar.exe
+          path: dist/intar-${{ matrix.platform.target }}.exe
 
   release:
     name: Release
@@ -241,8 +255,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*/intar
-            dist/*/intar.exe
+            dist/*/intar-*
           generate_release_notes: true
 
   e2e:
