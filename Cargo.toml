@@ -1,6 +1,10 @@
 [workspace]
 members = ["crates/*"]
-resolver = "2"
+resolver = "3"
+
+[workspace.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"
 
 [workspace.package]
 version = "0.1.1"
