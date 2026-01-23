@@ -210,7 +210,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: just check
-        run: just check
 
   build:
     name: Build - ${{ matrix.platform.os-name }}
