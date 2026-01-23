@@ -49,6 +49,7 @@ Rules (strict):
 - Body is required for every commit and must include **Why** and **Impact**
   sections exactly as shown.
 - Use bullet points under **Why** and **Impact** (at least one each).
+- Do not insert blank lines between bullet points.
 - Use **Breaking** only when relevant.
 - Wrap body lines at ~72 chars.
 - If multiple areas change, pick the dominant scope and mention the others in
