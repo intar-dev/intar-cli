@@ -31,6 +31,37 @@ const DEFAULT_MASK_UNITS: &[&str] = &[
     "snapd.autoimport.service",
 ];
 
+const AGENT_SEED_RUNCMD: &str = r#"  - |
+      set -eu
+      if [ ! -x /usr/local/bin/intar-agent ]; then
+        for seed in /var/lib/cloud/seed/nocloud /var/lib/cloud/seed/nocloud-net /run/cloud-init/seed/nocloud /run/cloud-init/seed/nocloud-net; do
+          if [ -f "$seed/intar-agent" ]; then
+            cp "$seed/intar-agent" /usr/local/bin/intar-agent
+            chmod 0755 /usr/local/bin/intar-agent
+            break
+          fi
+        done
+      fi
+      if [ ! -x /usr/local/bin/intar-agent ]; then
+        mountpoint=/mnt/cidata
+        mkdir -p "$mountpoint"
+        if [ -e /dev/disk/by-label/cidata ]; then
+          mount -o ro /dev/disk/by-label/cidata "$mountpoint" 2>/dev/null || true
+        elif [ -e /dev/sr0 ]; then
+          mount -o ro /dev/sr0 "$mountpoint" 2>/dev/null || true
+        fi
+        if [ -f "$mountpoint/intar-agent" ]; then
+          cp "$mountpoint/intar-agent" /usr/local/bin/intar-agent
+          chmod 0755 /usr/local/bin/intar-agent
+        fi
+        umount "$mountpoint" 2>/dev/null || true
+      fi
+      if [ ! -x /usr/local/bin/intar-agent ]; then
+        echo "intar-agent not found in cloud-init seed" >&2
+        exit 1
+      fi
+"#;
+
 impl CloudInitGenerator {
     #[must_use]
     pub fn new(ssh_public_key: String, agent_binary: Vec<u8>) -> Self {
@@ -42,11 +73,6 @@ impl CloudInitGenerator {
 
     #[must_use]
     pub fn generate_user_data(&self, config: &CloudInitConfig, hostname: &str) -> String {
-        let agent_base64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &self.agent_binary,
-        );
-
         let mut user_data = String::from("#cloud-config\n");
 
         let _ = writeln!(user_data, "hostname: {hostname}");
@@ -68,11 +94,6 @@ impl CloudInitGenerator {
         }
 
         user_data.push_str("write_files:\n");
-        user_data.push_str("  - path: /usr/local/bin/intar-agent\n");
-        user_data.push_str("    permissions: '0755'\n");
-        user_data.push_str("    encoding: base64\n");
-        let _ = writeln!(user_data, "    content: {agent_base64}");
-
         user_data.push_str("  - path: /usr/local/bin/intar-shell\n");
         user_data.push_str("    permissions: '0755'\n");
         user_data.push_str("    content: |\n");
@@ -117,6 +138,7 @@ impl CloudInitGenerator {
         }
 
         user_data.push_str("runcmd:\n");
+        user_data.push_str(AGENT_SEED_RUNCMD);
         user_data.push_str("  - systemctl daemon-reload\n");
         user_data.push_str("  - grep -qxF /usr/local/bin/intar-shell /etc/shells || echo /usr/local/bin/intar-shell >> /etc/shells\n");
         user_data.push_str("  - |\n");
@@ -204,48 +226,67 @@ impl CloudInitGenerator {
             std::fs::write(path, network_cfg)?;
         }
 
+        let agent_path = if self.agent_binary.is_empty() {
+            None
+        } else {
+            let path = temp_dir.path().join("intar-agent");
+            std::fs::write(&path, &self.agent_binary)?;
+            Some(path)
+        };
+
         // Try multiple tools in order of preference
-        Self::try_cloud_localds(
-            output_path,
-            &user_data_path,
-            &meta_data_path,
-            network_config_path.as_deref(),
-        )
-        .or_else(|_| {
+        let mut result = if agent_path.is_none() {
+            Self::try_cloud_localds(
+                output_path,
+                &user_data_path,
+                &meta_data_path,
+                network_config_path.as_deref(),
+                None,
+            )
+        } else {
+            Err(VmError::CloudInit("ISO requires extra files".into()))
+        };
+
+        result = result.or_else(|_| {
             Self::try_mkisofs(
                 output_path,
                 &user_data_path,
                 &meta_data_path,
                 network_config_path.as_deref(),
+                agent_path.as_deref(),
             )
-        })
-        .or_else(|_| {
+        });
+        result = result.or_else(|_| {
             Self::try_genisoimage(
                 output_path,
                 &user_data_path,
                 &meta_data_path,
                 network_config_path.as_deref(),
+                agent_path.as_deref(),
             )
-        })
-        .or_else(|_| {
+        });
+        result = result.or_else(|_| {
             Self::try_xorriso(
                 output_path,
                 &user_data_path,
                 &meta_data_path,
                 network_config_path.as_deref(),
+                agent_path.as_deref(),
             )
-        })
-        .or_else(|_| {
+        });
+        result = result.or_else(|_| {
             Self::try_hdiutil(
                 output_path,
                 &user_data_path,
                 &meta_data_path,
                 network_config_path.as_deref(),
+                agent_path.as_deref(),
             )
-        })
-        .map_err(|_| {
+        });
+
+        result.map_err(|_| {
             VmError::CloudInit(
-                "No ISO creation tool available. Install one of: cloud-localds, mkisofs (brew install cdrtools), genisoimage, or xorriso".into(),
+                "No ISO creation tool available. Install one of: mkisofs (brew install cdrtools), genisoimage, xorriso, or use hdiutil on macOS".into(),
             )
         })
     }
@@ -255,7 +296,14 @@ impl CloudInitGenerator {
         user_data_path: &Path,
         meta_data_path: &Path,
         network_config_path: Option<&Path>,
+        extra_path: Option<&Path>,
     ) -> Result<(), VmError> {
+        if extra_path.is_some() {
+            return Err(VmError::CloudInit(
+                "cloud-localds does not support extra files".into(),
+            ));
+        }
+
         let mut cmd = Command::new("cloud-localds");
         if let Some(network_cfg) = network_config_path {
             cmd.arg(format!("--network-config={}", path_to_str(network_cfg)?));
@@ -282,6 +330,7 @@ impl CloudInitGenerator {
         user_data_path: &Path,
         meta_data_path: &Path,
         network_config_path: Option<&Path>,
+        extra_path: Option<&Path>,
     ) -> Result<(), VmError> {
         let output_str = path_to_str(output_path)?;
         let user_data_str = path_to_str(user_data_path)?;
@@ -298,6 +347,9 @@ impl CloudInitGenerator {
         ];
         if let Some(network_cfg) = network_config_path {
             args.push(path_to_str(network_cfg)?.into());
+        }
+        if let Some(extra) = extra_path {
+            args.push(path_to_str(extra)?.into());
         }
 
         let output = Command::new("mkisofs")
@@ -318,6 +370,7 @@ impl CloudInitGenerator {
         user_data_path: &Path,
         meta_data_path: &Path,
         network_config_path: Option<&Path>,
+        extra_path: Option<&Path>,
     ) -> Result<(), VmError> {
         let output_str = path_to_str(output_path)?;
         let user_data_str = path_to_str(user_data_path)?;
@@ -334,6 +387,9 @@ impl CloudInitGenerator {
         ];
         if let Some(network_cfg) = network_config_path {
             args.push(path_to_str(network_cfg)?.into());
+        }
+        if let Some(extra) = extra_path {
+            args.push(path_to_str(extra)?.into());
         }
 
         let output = Command::new("genisoimage")
@@ -354,6 +410,7 @@ impl CloudInitGenerator {
         user_data_path: &Path,
         meta_data_path: &Path,
         network_config_path: Option<&Path>,
+        extra_path: Option<&Path>,
     ) -> Result<(), VmError> {
         let output_str = path_to_str(output_path)?;
         let user_data_str = path_to_str(user_data_path)?;
@@ -372,6 +429,9 @@ impl CloudInitGenerator {
         ];
         if let Some(network_cfg) = network_config_path {
             args.push(path_to_str(network_cfg)?.into());
+        }
+        if let Some(extra) = extra_path {
+            args.push(path_to_str(extra)?.into());
         }
 
         let output = Command::new("xorriso")
@@ -392,6 +452,7 @@ impl CloudInitGenerator {
         user_data_path: &Path,
         meta_data_path: &Path,
         network_config_path: Option<&Path>,
+        extra_path: Option<&Path>,
     ) -> Result<(), VmError> {
         // hdiutil is macOS-specific, create a temp directory structure first
         let temp_dir = tempfile::tempdir().map_err(|e| VmError::CloudInit(e.to_string()))?;
@@ -403,6 +464,9 @@ impl CloudInitGenerator {
         std::fs::copy(meta_data_path, iso_root.join("meta-data"))?;
         if let Some(network_cfg) = network_config_path {
             std::fs::copy(network_cfg, iso_root.join("network-config"))?;
+        }
+        if let Some(extra) = extra_path {
+            std::fs::copy(extra, iso_root.join("intar-agent"))?;
         }
 
         let output = Command::new("hdiutil")

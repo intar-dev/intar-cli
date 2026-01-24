@@ -1,6 +1,6 @@
 use crate::widgets::{
-    BriefingScreen, CompletedScreen, ConfirmDialog, HelpOverlay, ProbeStatus, ScenarioTreeScreen,
-    VmStatus, VmTreeNode, VmTreeProbe,
+    BriefingScreen, CompletedScreen, ConfirmDialog, HelpMode, HelpOverlay, ProbeStatus,
+    ScenarioTreeScreen, VmStatus, VmTreeNode, VmTreeProbe,
 };
 use crate::{ColorLevel, Theme, ThemeMode, ThemeSettings};
 use crossterm::{
@@ -470,6 +470,9 @@ impl App {
         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         if self.is_briefing_phase() {
+            if self.handle_overlay_toggles(key) {
+                return Ok(false);
+            }
             if Self::should_quit(key, is_ctrl) {
                 self.initiate_shutdown(terminal).await?;
                 return Ok(true);
@@ -1018,7 +1021,17 @@ impl App {
         }
 
         if self.flags.show_help {
-            let help = HelpOverlay { theme: &self.theme };
+            let mode = if self.is_briefing_phase() {
+                HelpMode::Briefing
+            } else if matches!(self.phase, AppPhase::Completed) {
+                HelpMode::Completed
+            } else {
+                HelpMode::Running
+            };
+            let help = HelpOverlay {
+                theme: &self.theme,
+                mode,
+            };
             f.render_widget(help, area);
         }
     }

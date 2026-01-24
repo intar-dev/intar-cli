@@ -3,12 +3,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActionEvent {
+    SshCastStart {
+        ts_unix_ms: u64,
+        width: u16,
+        height: u16,
+    },
     SshSessionStart {
         ts_unix_ms: u64,
         user: String,
         kind: SshSessionKind,
     },
     SshRawInput {
+        ts_unix_ms: u64,
+        data_b64: String,
+    },
+    SshRawOutput {
         ts_unix_ms: u64,
         data_b64: String,
     },

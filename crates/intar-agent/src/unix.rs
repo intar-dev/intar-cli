@@ -210,6 +210,7 @@ fn record_command(real_shell: &str, command: &str) -> Result<i32, Box<dyn std::e
     let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
     let mut sink = connect_actions_sink();
     if let Some(s) = sink.as_mut() {
+        send_cast_start_event(s, tty_size(std::io::stdout().as_raw_fd()));
         send_event(
             s,
             &ActionEvent::SshSessionStart {
@@ -219,11 +220,14 @@ fn record_command(real_shell: &str, command: &str) -> Result<i32, Box<dyn std::e
             },
         );
         if !command.is_empty() {
+            let mut input = command.to_string();
+            input.push('\n');
+            let b64 = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
             send_event(
                 s,
-                &ActionEvent::SshLine {
+                &ActionEvent::SshRawInput {
                     ts_unix_ms: unix_ms(),
-                    line: command.to_string(),
+                    data_b64: b64,
                 },
             );
         }
@@ -233,27 +237,23 @@ fn record_command(real_shell: &str, command: &str) -> Result<i32, Box<dyn std::e
     let code = output.status.code().unwrap_or(1);
 
     if let Some(s) = sink.as_mut() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
+        if !output.stdout.is_empty() {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&output.stdout);
             send_event(
                 s,
-                &ActionEvent::SshOutput {
+                &ActionEvent::SshRawOutput {
                     ts_unix_ms: unix_ms(),
-                    line: line.to_string(),
+                    data_b64: b64,
                 },
             );
         }
-        for line in String::from_utf8_lossy(&output.stderr).lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
+        if !output.stderr.is_empty() {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&output.stderr);
             send_event(
                 s,
-                &ActionEvent::SshOutput {
+                &ActionEvent::SshRawOutput {
                     ts_unix_ms: unix_ms(),
-                    line: line.to_string(),
+                    data_b64: b64,
                 },
             );
         }
@@ -285,6 +285,10 @@ fn record_ssh(real_shell: &str) -> Result<i32, Box<dyn std::error::Error>> {
     close(slave_fd).ok();
 
     let (tx, writer_thread) = start_actions_event_stream();
+    send_cast_start(
+        &tx,
+        tty_size(stdout.as_raw_fd()).or_else(|| tty_size(stdin.as_raw_fd())),
+    );
     send_session_start(&tx);
 
     let proxy_result = proxy_pty_session(master_fd, &tx);
@@ -369,11 +373,6 @@ fn proxy_pty_session(
     let master_borrowed = unsafe { BorrowedFd::borrow_raw(master_fd) };
 
     let mut buf = [0u8; 4096];
-    let mut line = String::new();
-    let mut input_escape = false;
-    let mut output_line = String::new();
-    let mut output_escape = false;
-
     loop {
         let mut fds = [
             PollFd::new(stdin_borrowed, PollFlags::POLLIN),
@@ -392,7 +391,11 @@ fn proxy_pty_session(
                 Ok(n) => {
                     stdout.write_all(&buf[..n])?;
                     stdout.flush()?;
-                    derive_lines_from_output(&buf[..n], &mut output_line, &mut output_escape, tx);
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+                    let _ = tx.send(ActionEvent::SshRawOutput {
+                        ts_unix_ms: unix_ms(),
+                        data_b64: b64,
+                    });
                 }
                 Err(Errno::EINTR) => {}
                 Err(e) => return Err(e.into()),
@@ -411,21 +414,11 @@ fn proxy_pty_session(
                         ts_unix_ms: unix_ms(),
                         data_b64: b64,
                     });
-
-                    derive_lines_from_input(chunk, &mut line, &mut input_escape, tx);
                 }
                 Err(Errno::EINTR) => {}
                 Err(e) => return Err(e.into()),
             }
         }
-    }
-
-    let trimmed = output_line.trim();
-    if !trimmed.is_empty() && !is_prompt_line(trimmed) {
-        let _ = tx.send(ActionEvent::SshOutput {
-            ts_unix_ms: unix_ms(),
-            line: trimmed.to_string(),
-        });
     }
 
     Ok(())
@@ -438,107 +431,16 @@ fn is_fd_readable(fd: &PollFd<'_>) -> bool {
         || revents.contains(PollFlags::POLLERR)
 }
 
-fn derive_lines_from_input(
-    chunk: &[u8],
-    line: &mut String,
-    in_escape: &mut bool,
-    tx: &std::sync::mpsc::Sender<ActionEvent>,
-) {
-    for &b in chunk {
-        if *in_escape {
-            if (b as char).is_ascii_alphabetic() || b == b'~' {
-                *in_escape = false;
-            }
-            continue;
-        }
-
-        match b {
-            0x1b => {
-                *in_escape = true;
-            }
-            b'\r' | b'\n' => {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    let _ = tx.send(ActionEvent::SshLine {
-                        ts_unix_ms: unix_ms(),
-                        line: trimmed.to_string(),
-                    });
-                }
-                line.clear();
-            }
-            0x7f | 0x08 => {
-                let _ = line.pop();
-            }
-            b'\t' => line.push('\t'),
-            b if b.is_ascii_graphic() || b == b' ' => line.push(char::from(b)),
-            _ => {}
-        }
-    }
-}
-
-fn derive_lines_from_output(
-    chunk: &[u8],
-    line: &mut String,
-    in_escape: &mut bool,
-    tx: &std::sync::mpsc::Sender<ActionEvent>,
-) {
-    for &b in chunk {
-        if *in_escape {
-            if (b as char).is_ascii_alphabetic() || b == b'~' {
-                *in_escape = false;
-            }
-            continue;
-        }
-
-        match b {
-            0x1b => {
-                *in_escape = true;
-            }
-            b'\r' | b'\n' => {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && !is_prompt_line(trimmed) {
-                    let _ = tx.send(ActionEvent::SshOutput {
-                        ts_unix_ms: unix_ms(),
-                        line: trimmed.to_string(),
-                    });
-                }
-                line.clear();
-            }
-            0x7f | 0x08 => {
-                let _ = line.pop();
-            }
-            b'\t' => line.push('\t'),
-            b if b.is_ascii_graphic() || b == b' ' => line.push(char::from(b)),
-            _ => {}
-        }
-    }
-}
-
-fn is_prompt_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    if trimmed == "$" || trimmed == "#" {
-        return true;
-    }
-
-    let mut pos = trimmed.rfind('$');
-    if pos.is_none() {
-        pos = trimmed.rfind('#');
-    }
-
-    let Some(pos) = pos else {
-        return false;
-    };
-
-    if !trimmed[pos + 1..].starts_with(' ') && !trimmed[pos + 1..].is_empty() {
-        return false;
-    }
-
-    let prefix = &trimmed[..pos];
-    prefix.contains('@') && prefix.contains(':')
+fn send_cast_start_event(stream: &mut UnixStream, size: Option<(u16, u16)>) {
+    let (width, height) = size.unwrap_or((80, 24));
+    send_event(
+        stream,
+        &ActionEvent::SshCastStart {
+            ts_unix_ms: unix_ms(),
+            width,
+            height,
+        },
+    );
 }
 
 fn write_all_fd(fd: BorrowedFd<'_>, mut data: &[u8]) -> Result<(), Errno> {
@@ -585,6 +487,15 @@ fn send_session_start(tx: &std::sync::mpsc::Sender<ActionEvent>) {
         ts_unix_ms: unix_ms(),
         user: std::env::var("USER").unwrap_or_else(|_| "user".into()),
         kind: SshSessionKind::Interactive,
+    });
+}
+
+fn send_cast_start(tx: &std::sync::mpsc::Sender<ActionEvent>, size: Option<(u16, u16)>) {
+    let (width, height) = size.unwrap_or((80, 24));
+    let _ = tx.send(ActionEvent::SshCastStart {
+        ts_unix_ms: unix_ms(),
+        width,
+        height,
     });
 }
 
@@ -635,6 +546,22 @@ fn unix_ms() -> u64 {
 
 fn is_tty(fd: RawFd) -> bool {
     unsafe { nix::libc::isatty(fd) == 1 }
+}
+
+fn tty_size(fd: RawFd) -> Option<(u16, u16)> {
+    let mut size = nix::libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    let res = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ, &mut size) };
+    if res == -1 || size.ws_row == 0 || size.ws_col == 0 {
+        return None;
+    }
+
+    Some((size.ws_col, size.ws_row))
 }
 
 fn to_io_err(e: nix::Error) -> std::io::Error {

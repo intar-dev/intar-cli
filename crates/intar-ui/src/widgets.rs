@@ -356,6 +356,50 @@ impl BriefingScreen<'_> {
         let min_boot = 3u16.min(total_height);
         needed.min(total_height).max(min_boot)
     }
+
+    fn render_footer(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Thick)
+            .border_style(Style::default().fg(self.theme.border))
+            .style(Style::default().bg(self.theme.surface));
+
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        if inner.height == 0 {
+            return;
+        }
+
+        let key_style = if self.theme.is_monochrome() {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(self.theme.on_secondary)
+                .bg(self.theme.secondary)
+                .bold()
+        };
+
+        let keys = vec![("?", "Help"), ("T", "Theme"), ("Q", "Quit")];
+
+        let mut spans = Vec::new();
+        for (key, desc) in keys {
+            spans.push(Span::styled(format!(" {key} "), key_style));
+            spans.push(Span::styled(
+                format!(" {desc} "),
+                Style::default().fg(self.theme.dim),
+            ));
+            spans.push(Span::raw(" "));
+        }
+
+        let content_area = Layout::vertical([Constraint::Length(1)])
+            .flex(ratatui::layout::Flex::Center)
+            .split(inner)[0];
+
+        Paragraph::new(Line::from(spans))
+            .alignment(Alignment::Left)
+            .render(content_area, buf);
+    }
 }
 
 impl ScenarioTreeScreen<'_> {
@@ -753,14 +797,28 @@ impl Widget for BriefingScreen<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         Clear.render(area, buf);
 
-        let mut remaining = area.height;
-        let header_height = 4u16.min(remaining);
-        remaining = remaining.saturating_sub(header_height);
+        let footer_height = 3u16.min(area.height);
+        let available = area.height.saturating_sub(footer_height);
+        let header_height = 4u16.min(available);
+        let body_height = available.saturating_sub(header_height);
+
+        let header_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: header_height,
+        };
         let body_area = Rect {
             x: area.x,
             y: area.y + header_height,
             width: area.width,
-            height: remaining,
+            height: body_height,
+        };
+        let footer_area = Rect {
+            x: area.x,
+            y: area.y + header_height + body_height,
+            width: area.width,
+            height: footer_height,
         };
 
         let columns = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -780,12 +838,6 @@ impl Widget for BriefingScreen<'_> {
         .split(right_area);
 
         if header_height > 0 {
-            let header_area = Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: header_height,
-            };
             self.render_header(header_area, buf);
         }
         if left_area.height > 0 && left_area.width > 0 {
@@ -796,6 +848,9 @@ impl Widget for BriefingScreen<'_> {
         }
         if boot_height > 0 {
             self.render_boot_status(right_chunks[1], buf);
+        }
+        if footer_height > 0 {
+            self.render_footer(footer_area, buf);
         }
     }
 }
@@ -815,6 +870,14 @@ pub struct ConfirmDialog<'a> {
 
 pub struct HelpOverlay<'a> {
     pub theme: &'a Theme,
+    pub mode: HelpMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelpMode {
+    Briefing,
+    Running,
+    Completed,
 }
 
 impl Widget for ConfirmDialog<'_> {
@@ -879,8 +942,71 @@ impl Widget for ConfirmDialog<'_> {
 
 impl Widget for HelpOverlay<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let key_style = if self.theme.is_monochrome() {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(self.theme.on_secondary)
+                .bg(self.theme.secondary)
+                .bold()
+        };
+
+        let lines = match self.mode {
+            HelpMode::Briefing => vec![
+                Line::from(vec![
+                    Span::styled(" ? ", key_style),
+                    Span::raw(" Close help"),
+                ]),
+                Line::from(vec![
+                    Span::styled(" T ", key_style),
+                    Span::raw(" Toggle theme"),
+                ]),
+                Line::from(vec![Span::styled(" Q ", key_style), Span::raw(" Quit")]),
+            ],
+            HelpMode::Running => vec![
+                Line::from(vec![
+                    Span::styled(" TAB ", key_style),
+                    Span::raw(" Switch view"),
+                ]),
+                Line::from(vec![
+                    Span::styled(" PGUP/PGDN ", key_style),
+                    Span::raw(" Scroll logs"),
+                ]),
+                Line::from(vec![
+                    Span::styled(" R ", key_style),
+                    Span::raw(" Restart scenario"),
+                ]),
+                Line::from(vec![
+                    Span::styled(" T ", key_style),
+                    Span::raw(" Toggle theme"),
+                ]),
+                Line::from(vec![Span::styled(" Q ", key_style), Span::raw(" Quit")]),
+                Line::from(vec![
+                    Span::styled(" ? ", key_style),
+                    Span::raw(" Close help"),
+                ]),
+            ],
+            HelpMode::Completed => vec![
+                Line::from(vec![
+                    Span::styled(" R ", key_style),
+                    Span::raw(" Restart scenario"),
+                ]),
+                Line::from(vec![
+                    Span::styled(" T ", key_style),
+                    Span::raw(" Toggle theme"),
+                ]),
+                Line::from(vec![Span::styled(" Q ", key_style), Span::raw(" Quit")]),
+                Line::from(vec![
+                    Span::styled(" ? ", key_style),
+                    Span::raw(" Close help"),
+                ]),
+            ],
+        };
+
         let dialog_width = 64u16;
-        let dialog_height = 13u16;
+        let dialog_height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(5);
 
         let x = area.x + (area.width.saturating_sub(dialog_width)) / 2;
         let y = area.y + (area.height.saturating_sub(dialog_height)) / 2;
@@ -905,47 +1031,6 @@ impl Widget for HelpOverlay<'_> {
 
         let inner = block.inner(dialog_area);
         block.render(dialog_area, buf);
-
-        let key_style = if self.theme.is_monochrome() {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(self.theme.on_secondary)
-                .bg(self.theme.secondary)
-                .bold()
-        };
-
-        let lines = vec![
-            Line::from(vec![
-                Span::styled(" TAB ", key_style),
-                Span::raw(" Switch view"),
-            ]),
-            Line::from(vec![
-                Span::styled(" SHIFT+TAB ", key_style),
-                Span::raw(" Previous view"),
-            ]),
-            Line::from(vec![
-                Span::styled(" PGUP/PGDN ", key_style),
-                Span::raw(" Scroll logs"),
-            ]),
-            Line::from(vec![
-                Span::styled(" HOME/END ", key_style),
-                Span::raw(" Oldest / newest logs"),
-            ]),
-            Line::from(vec![
-                Span::styled(" R ", key_style),
-                Span::raw(" Restart scenario"),
-            ]),
-            Line::from(vec![
-                Span::styled(" T ", key_style),
-                Span::raw(" Toggle theme"),
-            ]),
-            Line::from(vec![Span::styled(" Q ", key_style), Span::raw(" Quit")]),
-            Line::from(vec![
-                Span::styled(" ? ", key_style),
-                Span::raw(" Close help"),
-            ]),
-        ];
 
         Paragraph::new(lines)
             .alignment(Alignment::Left)

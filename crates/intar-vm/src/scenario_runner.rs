@@ -205,7 +205,7 @@ impl ScenarioRunner {
             let handle = start_vm_actions_task(
                 name.clone(),
                 vm.actions_socket.clone(),
-                vm.logs_dir.join("ssh-actions.ndjson"),
+                vm.logs_dir.clone(),
                 tx.clone(),
             );
             self.action_tasks.push(handle);

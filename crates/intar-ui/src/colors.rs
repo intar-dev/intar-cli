@@ -1,17 +1,16 @@
+use crossterm::terminal::is_raw_mode_enabled;
 use crossterm::tty::IsTty;
 use ratatui::style::Color;
 use std::env;
 use std::io;
-
-#[cfg(unix)]
-use std::io::Write;
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::time::Instant;
-
+use std::io::Write;
 #[cfg(unix)]
 use std::thread::sleep;
+#[cfg(unix)]
+use std::time::Instant;
 
 #[cfg(unix)]
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -312,12 +311,14 @@ fn palette_light_ansi16() -> ThemePalette {
 }
 
 fn detect_theme_mode() -> Option<ThemeMode> {
-    if !io::stdin().is_tty() || !io::stdout().is_tty() {
+    if !io::stdout().is_tty() {
         return None;
     }
 
-    if let Some(rgb) =
-        query_osc_11(Duration::from_millis(120)).and_then(|resp| parse_rgb_response(&resp))
+    if io::stdin().is_tty()
+        && is_raw_mode_enabled().unwrap_or(false)
+        && let Some(rgb) =
+            query_osc_11(Duration::from_millis(200)).and_then(|resp| parse_rgb_response(&resp))
     {
         let luminance =
             (0.2126 * f64::from(rgb.0) + 0.7152 * f64::from(rgb.1) + 0.0722 * f64::from(rgb.2))
